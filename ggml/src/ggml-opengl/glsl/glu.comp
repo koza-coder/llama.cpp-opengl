@@ -1,0 +1,96 @@
+#include "common.glsl"
+
+// Port of the D3D11 glu.hlsl. defines: TYPE_F32 or TYPE_F16, OP_{REGLU,GEGLU,SWIGLU,SWIGLU_OAI,GEGLU_ERF,
+// GEGLU_QUICK}, NO_SPLIT when both halves come from src0
+
+#if defined(TYPE_F16)
+#define LOAD(buf, i)     LOAD_F16(buf, i)
+#define STORE(buf, i, v) STORE_F16(buf, i, v)
+#else
+#define LOAD(buf, i)     LOAD_F32(buf, i)
+#define STORE(buf, i, v) STORE_F32(buf, i, v)
+#endif
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Src0 { uint src0[]; };
+layout(std430, binding = 1) buffer Src1 { uint src1[]; };
+layout(std430, binding = 2) buffer Dst  { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+
+    uint stride_src01;
+    uint stride_src02;
+    uint stride_src03;
+
+    uint stride_src11;
+    uint stride_src12;
+    uint stride_src13;
+
+    uint stride_dst1;
+    uint stride_dst2;
+    uint stride_dst3;
+
+    uint ne;
+    uint ne0;
+    uint ne1;
+    uint ne2;
+
+    uint swapped;
+    float alpha;
+    float limit;
+
+    uint nwg_x;
+};
+
+float op(float a, float b) {
+#if defined(OP_REGLU)
+    return max(a, 0.0) * b;
+#elif defined(OP_GEGLU)
+    float val = 0.79788456080286535587989211986876 * a * (1.0 + 0.044715 * a * a);
+    return 0.5 * a * (2.0 - 2.0 / (exp(2.0 * val) + 1.0)) * b;
+#elif defined(OP_SWIGLU)
+    return a / (1.0 + exp(-a)) * b;
+#elif defined(OP_SWIGLU_OAI)
+    float xi = min(a, limit);
+    float gi = max(min(b, limit), -limit);
+    return xi / (1.0 + exp(-xi * alpha)) * (1.0 + gi);
+#elif defined(OP_GEGLU_ERF)
+    float x   = abs(a * 0.7071067811865476);
+    float sgn = a >= 0.0 ? 1.0 : -1.0;
+    float t   = 1.0 / (1.0 + 0.3275911 * x);
+    float y   = 1.0 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x));
+    return 0.5 * a * (1.0 + sgn * y) * b;
+#elif defined(OP_GEGLU_QUICK)
+    return a * (1.0 / (1.0 + exp(-1.702 * a))) * b;
+#endif
+}
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+    uint i3 = i / (ne2 * ne1 * ne0);
+    i = i % (ne2 * ne1 * ne0);
+    uint i2 = i / (ne1 * ne0);
+    i = i % (ne1 * ne0);
+    uint i1 = i / ne0;
+    uint i0 = i % ne0;
+
+    uint i_a   = offset_src0 + i3 * stride_src03 + i2 * stride_src02 + i1 * stride_src01 + i0;
+    uint i_b   = offset_src1 + i3 * stride_src13 + i2 * stride_src12 + i1 * stride_src11 + i0;
+    uint i_dst = offset_dst + i3 * stride_dst3 + i2 * stride_dst2 + i1 * stride_dst1 + i0;
+
+#ifdef NO_SPLIT
+    float a = LOAD(src0, i_a + (swapped != 0u ? ne0 : 0u));
+    float b = LOAD(src0, i_a + (swapped != 0u ? 0u : ne0));
+#else
+    float a = LOAD(src0, i_a);
+    float b = LOAD(src1, i_b);
+#endif
+    STORE(dst, i_dst, op(a, b));
+}

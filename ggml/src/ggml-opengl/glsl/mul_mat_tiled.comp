@@ -1,0 +1,275 @@
+#include "common.glsl"
+
+// Port of the D3D11 mul_mat_tiled.hlsl, no MUL_MAT_ID:
+// dst[row, col] = sum_k src0[row, k] * src1[col, k] for the prompt path.
+//
+// A workgroup owns a TILE_M x TILE_N tile of dst and walks k in steps of TILE_K: each step loads
+// TILE_M x TILE_K weights into shared memory once and every one of them is then used TILE_N times from
+// there. Accumulators live in registers, so there is no reduction tree.
+//
+// defines: SRC0_{F32,F16,Q4_0,Q8_0,Q4_K,Q6_K}, SRC1_F16 (f16 columns instead of f32). k must be a multiple
+// of TILE_K. src0 offsets/strides are in elements for float types and in blocks for quant types.
+
+#define TILE_M 64
+#define TILE_N 32
+#define TILE_K 32
+
+// 256 threads as a 16 x 16 grid; each thread owns 4 rows and 2 columns of the output tile
+#define TH_X 16
+#define TH_Y 16
+#define REG_M (TILE_M / TH_Y)
+#define REG_N (TILE_N / TH_X)
+#define NTHREADS (TH_X * TH_Y)
+
+// GLSL 4.30 takes only a literal here, not an expression
+#if NTHREADS != 256
+#error NTHREADS must match local_size_x
+#endif
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Src1 { uint src1[]; };
+layout(std430, binding = 1) buffer Src0 { uint src0[]; };
+layout(std430, binding = 2) buffer Dst  { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+    uint m;           // rows of src0 / dst
+    uint n;           // columns of src1 / dst
+    uint k;           // shared dimension
+    uint stride_01;   // src0 row stride, elements
+    uint stride_02;
+    uint stride_03;
+    uint stride_11;   // src1 column stride, elements
+    uint stride_12;
+    uint stride_13;
+    uint ne2;         // dst dim 2
+    uint broadcast2;  // src1 dim 2 / src0 dim 2
+    uint broadcast3;
+    uint n_batches;   // dst ne2 * ne3; the dispatch is rounded up to a 2D grid, so it can overshoot
+    uint nwg_x;
+};
+
+#define BYTE_OF(q, b) (((q) >> ((b) * 8u)) & 0xFFu)
+#define SBYTE_OF(q, b) bitfieldExtract(int(q), int((b) * 8u), 8)
+
+shared float Atile[TILE_K][TILE_M];
+shared float Btile[TILE_K][TILE_N];
+
+#if defined(SRC1_F16)
+float load_src1(uint i) {
+    uint bits;
+    LOAD_U16_UNALIGNED(src1, i * 2u, bits);
+    return f16_to_f32(bits);
+}
+#else
+float load_src1(uint i) {
+    return LOAD_F32(src1, i);
+}
+#endif
+
+// the TILE_K elements of one src0 row starting at element k0 into Atile column col
+void load_a_row(uint row_base, uint k0, uint col) {
+#if defined(SRC0_F32)
+    for (uint i = 0u; i < uint(TILE_K); i++) {
+        Atile[i][col] = uintBitsToFloat(src0[row_base + k0 + i]);
+    }
+#elif defined(SRC0_F16)
+    for (uint i = 0u; i < uint(TILE_K); i += 2u) {
+        uint w;
+        LOAD_U32_UNALIGNED(src0, (row_base + k0 + i) * 2u, w);
+        Atile[i][col]      = f16_to_f32(w);
+        Atile[i + 1u][col] = f16_to_f32(w >> 16);
+    }
+#elif defined(SRC0_Q8_0)
+    // block (34 bytes): f16 d, 32 int8
+    uint base = (row_base + k0 / 32u) * 34u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    float d = f16_to_f32(dbits);
+    for (uint j = 0u; j < 8u; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, base + 2u + 4u * j, q);
+        for (uint b = 0u; b < 4u; b++) {
+            Atile[j * 4u + b][col] = float(SBYTE_OF(q, b)) * d;
+        }
+    }
+#elif defined(SRC0_Q4_0)
+    // block (18 bytes): f16 d, 16 bytes of nibbles; low nibbles are elements 0..15, high nibbles 16..31
+    uint base = (row_base + k0 / 32u) * 18u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    float d = f16_to_f32(dbits);
+    for (uint j = 0u; j < 4u; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, base + 2u + 4u * j, q);
+        for (uint b = 0u; b < 4u; b++) {
+            uint byte_v = BYTE_OF(q, b);
+            Atile[j * 4u + b][col]       = (float(byte_v & 0xFu) - 8.0) * d;
+            Atile[16u + j * 4u + b][col] = (float(byte_v >> 4) - 8.0) * d;
+        }
+    }
+#elif defined(SRC0_Q4_K)
+    // super-block of 256 (144 bytes): f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of nibbles.
+    // Sub-block s (32 values): pair s/2 uses bytes 16 + 32*(s/2), low nibbles for even s, high for odd s.
+    uint blk  = k0 / 256u;
+    uint s    = (k0 % 256u) / 32u;
+    uint base = (row_base + blk) * 144u;
+    uint w;
+    LOAD_U32_UNALIGNED(src0, base, w);
+    float d    = f16_to_f32(w);
+    float dmin = f16_to_f32(w >> 16);
+    uint sc0, sc1, sc2;
+    LOAD_U32_UNALIGNED(src0, base + 4u, sc0);
+    LOAD_U32_UNALIGNED(src0, base + 8u, sc1);
+    LOAD_U32_UNALIGNED(src0, base + 12u, sc2);
+    uint sc, mn;
+    if (s < 4u) {
+        sc = BYTE_OF(sc0, s) & 63u;
+        mn = BYTE_OF(sc1, s) & 63u;
+    } else {
+        sc = (BYTE_OF(sc2, s - 4u) & 0xFu) | ((BYTE_OF(sc0, s - 4u) >> 6) << 4);
+        mn = (BYTE_OF(sc2, s - 4u) >> 4) | ((BYTE_OF(sc1, s - 4u) >> 6) << 4);
+    }
+    float dl    = d * float(sc);
+    float ml    = dmin * float(mn);
+    uint  shift = (s & 1u) * 4u;
+    uint  qbase = base + 16u + 32u * (s / 2u);
+    for (uint j = 0u; j < 8u; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, qbase + 4u * j, q);
+        for (uint b = 0u; b < 4u; b++) {
+            Atile[j * 4u + b][col] = dl * float((BYTE_OF(q, b) >> shift) & 0xFu) - ml;
+        }
+    }
+#elif defined(SRC0_Q6_K)
+    // super-block of 256 (210 bytes): 128 bytes ql, 64 bytes qh, 16 int8 scales, f16 d.
+    // Sub-block s: half h = s/4 (128 values), t = s%4 selects the quarter inside the half.
+    uint blk  = k0 / 256u;
+    uint s    = (k0 % 256u) / 32u;
+    uint h    = s / 4u;
+    uint t    = s % 4u;
+    uint base = (row_base + blk) * 210u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base + 208u, dbits);
+    float d       = f16_to_f32(dbits);
+    uint  ql_base = base + 64u * h + 32u * (t & 1u);
+    uint  qh_base = base + 128u + 32u * h;
+    uint  sc_base = base + 192u + 8u * h + 2u * t;
+    uint  lshift  = (t >> 1) * 4u;
+    uint  hshift  = t * 2u;
+    uint scw;
+    LOAD_U32_UNALIGNED(src0, sc_base, scw);
+    float d0 = d * float(SBYTE_OF(scw, 0u));
+    float d1 = d * float(SBYTE_OF(scw, 1u));
+    for (uint j = 0u; j < 8u; j++) {
+        uint ql, qh;
+        LOAD_U32_UNALIGNED(src0, ql_base + 4u * j, ql);
+        LOAD_U32_UNALIGNED(src0, qh_base + 4u * j, qh);
+        float dsc = (j < 4u) ? d0 : d1;
+        for (uint b = 0u; b < 4u; b++) {
+            int q = int(((BYTE_OF(ql, b) >> lshift) & 0xFu) | (((BYTE_OF(qh, b) >> hshift) & 3u) << 4)) - 32;
+            Atile[j * 4u + b][col] = dsc * float(q);
+        }
+    }
+#endif
+}
+
+void main() {
+    uint tid       = gl_LocalInvocationID.x;
+    uint tx        = tid % uint(TH_X);          // column group
+    uint ty        = tid / uint(TH_X);          // row group
+    uint wg_linear = gl_WorkGroupID.y * nwg_x + gl_WorkGroupID.x;
+
+    uint tiles_m = (m + uint(TILE_M) - 1u) / uint(TILE_M);
+    uint tiles_n = (n + uint(TILE_N) - 1u) / uint(TILE_N);
+    uint tile_id = wg_linear % (tiles_m * tiles_n);
+    uint batch   = wg_linear / (tiles_m * tiles_n);
+
+    // workgroups past the batch count run no k steps and store nothing (no early return before barriers)
+    bool wg_ok = batch < n_batches;
+    if (!wg_ok) {
+        batch = 0u;
+    }
+    uint batches2  = ne2;
+    uint dst2_idx  = batch % batches2;
+    uint dst3_idx  = batch / batches2;
+    uint src02_idx = dst2_idx / broadcast2;
+    uint src03_idx = dst3_idx / broadcast3;
+
+    uint row0 = (tile_id % tiles_m) * uint(TILE_M);
+    uint col0 = (tile_id / tiles_m) * uint(TILE_N);
+
+    // staging: threads 0..TILE_M-1 take one src0 row each; all threads share the src1 tile,
+    // 8 threads per column, 4 values each
+    uint b_col  = tid / 8u;
+    uint b_part = tid % 8u;
+
+    uint a_batch = offset_src0 + src03_idx * stride_03 + src02_idx * stride_02;
+    uint b_batch = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12;
+    uint k_end   = wg_ok ? k : 0u;
+    bool b_ok    = col0 + b_col < n;
+    uint b_base  = b_batch + (col0 + b_col) * stride_11;
+
+    float acc[REG_M][REG_N];
+    for (uint im = 0u; im < uint(REG_M); im++) {
+        for (uint jn = 0u; jn < uint(REG_N); jn++) {
+            acc[im][jn] = 0.0;
+        }
+    }
+
+    for (uint kt = 0u; kt < k_end; kt += uint(TILE_K)) {
+        if (tid < uint(TILE_M)) {
+            uint r = row0 + tid;
+            if (r < m) {
+                load_a_row(a_batch + r * stride_01, kt, tid);
+            } else {
+                for (uint z = 0u; z < uint(TILE_K); z++) {
+                    Atile[z][tid] = 0.0;
+                }
+            }
+        }
+        for (uint i = 0u; i < 4u; i++) {
+            uint ki = b_part * 4u + i;
+            Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0;
+        }
+        memoryBarrierShared();
+        barrier();
+
+        for (uint kk = 0u; kk < uint(TILE_K); kk++) {
+            float a[REG_M];
+            float b[REG_N];
+            for (uint im2 = 0u; im2 < uint(REG_M); im2++) {
+                a[im2] = Atile[kk][ty * uint(REG_M) + im2];
+            }
+            for (uint in2 = 0u; in2 < uint(REG_N); in2++) {
+                b[in2] = Btile[kk][tx * uint(REG_N) + in2];
+            }
+            for (uint im3 = 0u; im3 < uint(REG_M); im3++) {
+                for (uint in3 = 0u; in3 < uint(REG_N); in3++) {
+                    acc[im3][in3] += a[im3] * b[in3];
+                }
+            }
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (!wg_ok) {
+        return;
+    }
+    uint dst_base = offset_dst + dst3_idx * (m * n * batches2) + dst2_idx * (m * n);
+    for (uint im4 = 0u; im4 < uint(REG_M); im4++) {
+        uint r = row0 + ty * uint(REG_M) + im4;
+        if (r >= m) {
+            continue;
+        }
+        for (uint in4 = 0u; in4 < uint(REG_N); in4++) {
+            uint c = col0 + tx * uint(REG_N) + in4;
+            if (c < n) {
+                STORE_F32(dst, dst_base + c * m + r, acc[im4][in4]);
+            }
+        }
+    }
+}

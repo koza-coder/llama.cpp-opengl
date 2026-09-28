@@ -54,6 +54,10 @@
 #include "ggml-zdnn.h"
 #endif
 
+#ifdef GGML_USE_OPENGL
+#include "ggml-opengl.h"
+#endif
+
 #ifdef GGML_USE_OPENCL
 #include "ggml-opencl.h"
 #endif
@@ -139,6 +143,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_ZDNN
         register_backend(ggml_backend_zdnn_reg());
+#endif
+#ifdef GGML_USE_OPENGL
+        register_backend(ggml_backend_opengl_reg());
 #endif
 #ifdef GGML_USE_VIRTGPU_FRONTEND
         register_backend(ggml_backend_virtgpu_reg());
@@ -596,6 +603,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("hexagon", silent, dir_path);
     ggml_backend_load_best("musa", silent, dir_path);
     ggml_backend_load_best("openvino", silent, dir_path);
+    ggml_backend_load_best("opengl", silent, dir_path);
     ggml_backend_load_best("cpu", silent, dir_path);
     // check the environment variable GGML_BACKEND_PATH to load an out-of-tree backend
     const char * backend_path = std::getenv("GGML_BACKEND_PATH");
