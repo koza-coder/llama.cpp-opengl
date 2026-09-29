@@ -1,0 +1,288 @@
+#include "common.glsl"
+
+// Port of the D3D11 flash_attn.hlsl.
+// FLASH_ATTN_EXT with the online softmax of the CPU reference, in two passes so no per-thread loop runs over the
+// whole KV length and no n_q x n_kv score matrix is stored:
+//   pass 1 (default): one workgroup per (output row, KV block of blk_size = WG_SIZE entries)
+//     writes the block's log-sum-exp of the scores and its softmax-weighted value sum to tmp[(t * n_blocks + b) * (DV + 1)]
+//   pass 2 (COMBINE): one thread per output row merges its blocks (and the sink) into dst
+// Output row = i3 * n_q * n_head + i1 * n_head + i2; a dispatch covers rows row0 .. row0 + n_rows - 1 and t is
+// the row index inside that range.
+// defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32 or K_Q8_0, V_F16, V_F32 or V_Q8_0,
+//          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Qb { uint q_buf[]; };
+layout(std430, binding = 1) buffer Kb { uint k_buf[]; };
+layout(std430, binding = 2) buffer Vb { uint v_buf[]; };
+layout(std430, binding = 3) buffer Mb { uint mask[]; };
+layout(std430, binding = 4) buffer Sb { uint sinks[]; };
+layout(std430, binding = 5) buffer Db { uint dst[]; };
+layout(std430, binding = 6) buffer Tb { uint tmp[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_q;
+    uint offset_k;
+    uint offset_v;
+    uint offset_mask;
+    uint offset_sinks;
+    uint offset_dst;
+
+    uint stride_q1;
+    uint stride_q2;
+    uint stride_q3;
+    uint stride_k1;
+    uint stride_k2;
+    uint stride_k3;
+    uint stride_v1;
+    uint stride_v2;
+    uint stride_v3;
+    uint stride_m1;
+    uint stride_m2;
+    uint stride_m3;
+
+    uint mask_ne2;
+    uint mask_ne3;
+    uint n_q;       // query rows (q->ne[1])
+    uint n_head;    // q->ne[2]
+    uint n_kv;      // k->ne[1]
+    uint rk2;       // q heads per k head
+    uint rk3;
+    uint rv2;
+    uint rv3;
+
+    float scale;    // already divided by logit_softcap when SOFTCAP is set
+    float max_bias;
+    float logit_softcap;
+    float n_head_log2;
+    float m0;
+    float m1;
+
+    uint blk_size;
+    uint n_blocks;
+    uint row0;
+    uint n_rows;
+    uint nwg_x;
+};
+
+#define NEG_INF_SCORE -3.4028235e38
+
+#if !defined(COMBINE)
+// f16 element i (element index) of an SSBO
+#define F16_AT(buf, i) f16_to_f32((buf)[(i) >> 1] >> (((i) & 1u) * 16u))
+
+// q8_0 K/V: offsets and strides are in blocks, element i = block * 32 + index in block; the 4 elements always
+// share one block (head sizes are multiples of 32)
+#define LOAD_Q8_0_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 34u; \
+    uint _dbits; \
+    LOAD_U16_UNALIGNED(buf, _byte, _dbits); \
+    uint _a = _byte + 2u + (i) % 32u; \
+    uint _w = (buf)[_a >> 2]; \
+    if ((_a & 2u) != 0u) { \
+        _w = (_w >> 16) | ((buf)[(_a >> 2) + 1u] << 16); \
+    } \
+    out = f16_to_f32(_dbits) * vec4(bitfieldExtract(int(_w), 0, 8), bitfieldExtract(int(_w), 8, 8), \
+                                    bitfieldExtract(int(_w), 16, 8), bitfieldExtract(int(_w), 24, 8)); \
+}
+
+vec4 load_k4(uint i) {
+    vec4 r;
+#if defined(K_Q8_0)
+    LOAD_Q8_0_4(k_buf, i, r);
+#elif defined(K_F16)
+    r = vec4(F16_AT(k_buf, i), F16_AT(k_buf, i + 1u), F16_AT(k_buf, i + 2u), F16_AT(k_buf, i + 3u));
+#else
+    r = vec4(uintBitsToFloat(k_buf[i]), uintBitsToFloat(k_buf[i + 1u]), uintBitsToFloat(k_buf[i + 2u]), uintBitsToFloat(k_buf[i + 3u]));
+#endif
+    return r;
+}
+
+vec4 load_v4(uint i) {
+    vec4 r;
+#if defined(V_Q8_0)
+    LOAD_Q8_0_4(v_buf, i, r);
+#elif defined(V_F16)
+    r = vec4(F16_AT(v_buf, i), F16_AT(v_buf, i + 1u), F16_AT(v_buf, i + 2u), F16_AT(v_buf, i + 3u));
+#else
+    r = vec4(uintBitsToFloat(v_buf[i]), uintBitsToFloat(v_buf[i + 1u]), uintBitsToFloat(v_buf[i + 2u]), uintBitsToFloat(v_buf[i + 3u]));
+#endif
+    return r;
+}
+#endif
+
+#if defined(COMBINE)
+void main() {
+    uint t = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (t >= n_rows) {
+        return;
+    }
+    uint row = row0 + t;
+    uint i2  = row % n_head;
+
+    // blocks hold normalized value sums and their log-sum-exp s_b: out = sum_b exp(s_b - M) * v_b / S with
+    // M the largest s_b (or sink) and S = sum_b exp(s_b - M) (+ exp(sink - M)). Two loops over the blocks
+    // instead of DV/4 vec4 accumulators per thread, which the AMD GL compiler did not handle (exp27-exp30).
+    float M = NEG_INF_SCORE;
+    for (uint b = 0u; b < n_blocks; b++) {
+        M = max(M, uintBitsToFloat(tmp[(t * n_blocks + b) * uint(DV + 1)]));
+    }
+#if defined(HAS_SINKS)
+    // the sink is one more logit in the denominator with no value vector
+    float sink = uintBitsToFloat(sinks[offset_sinks + i2]);
+    M = max(M, sink);
+#endif
+    float S = 0.0;
+    for (uint b = 0u; b < n_blocks; b++) {
+        float s = uintBitsToFloat(tmp[(t * n_blocks + b) * uint(DV + 1)]);
+        if (s > NEG_INF_SCORE) {   // NEG_INF_SCORE: every entry of the block masked
+            S += exp(s - M);
+        }
+    }
+#if defined(HAS_SINKS)
+    S += exp(sink - M);
+#endif
+
+    float inv      = S == 0.0 ? 0.0 : 1.0 / S;
+    uint  dst_base = offset_dst + row * uint(DV);
+    for (uint d = 0u; d < uint(DV); d++) {
+        float acc = 0.0;
+        for (uint b = 0u; b < n_blocks; b++) {
+            uint  base = (t * n_blocks + b) * uint(DV + 1);
+            float s    = uintBitsToFloat(tmp[base]);
+            if (s > NEG_INF_SCORE) {
+                acc += exp(s - M) * uintBitsToFloat(tmp[base + 1u + d]);
+            }
+        }
+        dst[dst_base + d] = floatBitsToUint(acc * inv);
+    }
+}
+#else
+// pass 1: one workgroup per (output row, block of WG_SIZE KV entries), for any query length. Thread
+// j scores KV entry j, then thread d sums the softmax-weighted values of output element d. Same tmp layout.
+shared float q_sh[DK];
+shared float p_sh[WG_SIZE];
+shared float red_sh[WG_SIZE];
+
+void main() {
+    uint wg  = gl_WorkGroupID.x + nwg_x * gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (wg >= n_rows * n_blocks) {
+        return;
+    }
+    uint t   = wg / n_blocks;
+    uint b   = wg % n_blocks;
+    uint row = row0 + t;
+    uint i3  = row / (n_q * n_head);
+    uint i1  = (row % (n_q * n_head)) / n_head;
+    uint i2  = row % n_head;
+
+    uint q_base = offset_q + i3 * stride_q3 + i2 * stride_q2 + i1 * stride_q1;
+    for (uint a = tid; a < uint(DK); a += uint(WG_SIZE)) {
+        q_sh[a] = uintBitsToFloat(q_buf[q_base + a]);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
+    uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
+
+    // score of entry j; NEG_INF_SCORE when past the end or masked
+    uint  j = b * blk_size + tid;
+    float s = NEG_INF_SCORE;
+    if (j < n_kv) {
+        bool  visible = true;
+        float mv      = 0.0;
+#if defined(HAS_MASK)
+        uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2 % mask_ne2) * stride_m2 + i1 * stride_m1;
+        uint mbits  = (mask[(m_base + j) >> 1] >> (((m_base + j) & 1u) * 16u)) & 0xFFFFu;
+        visible = mbits != 0xFC00u;
+        float slope = 1.0;
+        if (max_bias > 0.0) {
+            float h = float(i2);
+            slope = h < n_head_log2 ? pow(m0, h + 1.0) : pow(m1, 2.0 * (h - n_head_log2) + 1.0);
+        }
+        mv = slope * f16_to_f32(mbits);
+#endif
+        if (visible) {
+#if defined(K_Q8_0)
+            uint kj = (k_base + j * stride_k1) * 32u;
+#else
+            uint kj = k_base + j * stride_k1;
+#endif
+            float d = 0.0;
+            for (uint a = 0u; a < uint(DK / 4); a++) {
+                d += dot(vec4(q_sh[4u * a], q_sh[4u * a + 1u], q_sh[4u * a + 2u], q_sh[4u * a + 3u]), load_k4(kj + 4u * a));
+            }
+            d *= scale;
+#if defined(SOFTCAP)
+            d = logit_softcap * tanh(clamp(d, -9.010913, 9.010913));
+#endif
+            s = d + mv;
+        }
+    }
+
+    // block maximum
+    red_sh[tid] = s;
+    memoryBarrierShared();
+    barrier();
+    for (uint h = uint(WG_SIZE) / 2u; h > 0u; h /= 2u) {
+        if (tid < h) {
+            red_sh[tid] = max(red_sh[tid], red_sh[tid + h]);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    float M = red_sh[0];
+    memoryBarrierShared();
+    barrier();
+
+    float p = s <= NEG_INF_SCORE ? 0.0 : exp(s - M);
+    p_sh[tid]   = p;
+    red_sh[tid] = p;
+    memoryBarrierShared();
+    barrier();
+    for (uint h2 = uint(WG_SIZE) / 2u; h2 > 0u; h2 /= 2u) {
+        if (tid < h2) {
+            red_sh[tid] += red_sh[tid + h2];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    float S = red_sh[0];
+
+    uint base = (t * n_blocks + b) * uint(DV + 1);
+    if (S == 0.0) {
+        if (tid == 0u) {
+            tmp[base] = floatBitsToUint(NEG_INF_SCORE);
+        }
+        return;
+    }
+    if (tid == 0u) {
+        tmp[base] = floatBitsToUint(M + log(S));
+    }
+    float inv = 1.0 / S;
+    uint  jn  = min(blk_size, n_kv - b * blk_size);
+    // thread tid owns 4 consecutive output elements per step
+    for (uint d4 = tid; d4 < uint(DV / 4); d4 += uint(WG_SIZE)) {
+        vec4 acc = vec4(0.0);
+        for (uint jj = 0u; jj < jn; jj++) {
+            float pj = p_sh[jj];
+            if (pj != 0.0) {
+#if defined(V_Q8_0)
+                uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                acc += pj * load_v4(vj + 4u * d4);
+            }
+        }
+        acc *= inv;
+        tmp[base + 1u + 4u * d4] = floatBitsToUint(acc.x);
+        tmp[base + 2u + 4u * d4] = floatBitsToUint(acc.y);
+        tmp[base + 3u + 4u * d4] = floatBitsToUint(acc.z);
+        tmp[base + 4u + 4u * d4] = floatBitsToUint(acc.w);
+    }
+}
+#endif

@@ -1,0 +1,118 @@
+#include "common.glsl"
+
+// Port of the D3D11 unary.hlsl. defines: TYPE_F32 or TYPE_F16 and one op define; math in f32. dst is contiguous.
+
+#if defined(TYPE_F16)
+#define LOAD(buf, i)     LOAD_F16(buf, i)
+#define STORE(buf, i, v) STORE_F16(buf, i, v)
+#else
+#define LOAD(buf, i)     LOAD_F32(buf, i)
+#define STORE(buf, i, v) STORE_F32(buf, i, v)
+#endif
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Src { uint src[]; };
+layout(std430, binding = 1) buffer Dst { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint ne;
+    uint offset_src;
+    uint offset_dst;
+
+    uint stride_src0;
+    uint stride_src1;
+    uint stride_src2;
+    uint stride_src3;
+
+    uint ne0;
+    uint ne1;
+    uint ne2;
+
+    float p0;   // clamp min
+    float p1;   // clamp max
+
+    uint nwg_x;
+};
+
+float erf_approx(float x) {
+    const float s  = x >= 0.0 ? 1.0 : -1.0;
+    const float ax = abs(x);
+    const float t  = 1.0 / (1.0 + 0.3275911 * ax);
+    const float y  = 1.0 - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t) * exp(-ax * ax);
+    return s * y;
+}
+
+float apply(float x) {
+#if defined(ABS)
+    return abs(x);
+#elif defined(SGN)
+    return x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0);
+#elif defined(NEG)
+    return -x;
+#elif defined(STEP)
+    return x > 0.0 ? 1.0 : 0.0;
+#elif defined(TANH)
+    return tanh(clamp(x, -9.010913, 9.010913));
+#elif defined(RELU)
+    return x > 0.0 ? x : 0.0;
+#elif defined(ELU)
+    return x > 0.0 ? x : exp(x) - 1.0;
+#elif defined(HARDSIGMOID)
+    return min(1.0, max(0.0, (x + 3.0) / 6.0));
+#elif defined(SIGMOID)
+    return 1.0 / (1.0 + exp(-x));
+#elif defined(SILU)
+    return x / (1.0 + exp(-x));
+#elif defined(EXP)
+    return exp(x);
+#elif defined(LOG)
+    return log(x);
+#elif defined(CLAMP)
+    return clamp(x, p0, p1);
+#elif defined(HARDSWISH)
+    return x * min(1.0, max(0.0, (x + 3.0) / 6.0));
+#elif defined(GELU)
+    return 0.5 * x * (1.0 + tanh(clamp(0.7978845608028654 * (x + 0.044715 * x * x * x), -9.010913, 9.010913)));
+#elif defined(GELU_QUICK)
+    return x * (1.0 / (1.0 + exp(clamp(-1.702 * x, -80.0, 80.0))));
+#elif defined(GELU_ERF)
+    return 0.5 * x * (1.0 + erf_approx(x * 0.7071067811865476));
+#elif defined(SOFTPLUS)
+    return x > 20.0 ? x : log(1.0 + exp(x));
+#elif defined(EXPM1)
+    return exp(x) - 1.0;
+#elif defined(FLOOR)
+    return floor(x);
+#elif defined(CEIL)
+    return ceil(x);
+#elif defined(ROUND)
+    return x >= 0.0 ? floor(x + 0.5) : ceil(x - 0.5);
+#elif defined(TRUNC)
+    return trunc(x);
+#elif defined(SQR)
+    return x * x;
+#elif defined(SQRT)
+    return sqrt(x);
+#elif defined(SIN)
+    return sin(x);
+#elif defined(COS)
+    return cos(x);
+#endif
+}
+
+void main() {
+    const uint flat_i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (flat_i >= ne) {
+        return;
+    }
+    uint i = flat_i;
+    const uint i3 = i / (ne2 * ne1 * ne0);
+    i = i % (ne2 * ne1 * ne0);
+    const uint i2 = i / (ne1 * ne0);
+    i = i % (ne1 * ne0);
+    const uint i1 = i / ne0;
+    const uint i0 = i % ne0;
+    const uint src_idx = i0 * stride_src0 + i1 * stride_src1 + i2 * stride_src2 + i3 * stride_src3;
+    STORE(dst, offset_dst + flat_i, apply(LOAD(src, offset_src + src_idx)));
+}

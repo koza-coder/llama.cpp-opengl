@@ -1,6 +1,6 @@
 #include "common.glsl"
 
-// Port of the D3D11 binary.hlsl. defines: TYPE_{F32,F16}, OP_{ADD,MUL}
+// Port of the D3D11 binary.hlsl. defines: TYPE_{F32,F16}, OP_{ADD,SUB,MUL,DIV}
 // dst may alias src0 (inplace) or src1: every thread reads its inputs before it writes its output.
 
 // the math runs in f32 for every type
@@ -50,8 +50,12 @@ layout(std140, binding = 0) uniform Params {
 float op(float a, float b) {
 #if defined(OP_ADD)
     return a + b;
+#elif defined(OP_SUB)
+    return a - b;
 #elif defined(OP_MUL)
     return a * b;
+#elif defined(OP_DIV)
+    return a / b;
 #endif
 }
 

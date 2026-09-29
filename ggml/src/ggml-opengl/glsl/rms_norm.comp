@@ -1,7 +1,8 @@
 #include "common.glsl"
 
 // Port of the D3D11 rms_norm.hlsl without the fusions. f32 only, one workgroup per row:
-// dst = src * rsqrt(mean(src^2) + eps)
+// dst = src * rsqrt(mean(src^2) + eps); with L2_NORM dst = src / max(sqrt(sum(src^2)), eps);
+// with NORM dst = (src - mean) * rsqrt(mean((src - mean)^2) + eps); with SUM_ROWS / MEAN dst[row] = sum / mean of the row
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -32,6 +33,22 @@ layout(std140, binding = 0) uniform Params {
 
 shared float scratch[WG_SIZE];
 
+// sum of v over the workgroup, returned to every thread
+float wg_sum(float v) {
+    uint tid = gl_LocalInvocationID.x;
+    scratch[tid] = v;
+    barrier();
+    for (uint off = uint(WG_SIZE) / 2u; off > 0u; off /= 2u) {
+        if (tid < off) {
+            scratch[tid] += scratch[tid + off];
+        }
+        barrier();
+    }
+    float r = scratch[0];
+    barrier();   // every thread has read scratch[0] before a second call overwrites it
+    return r;
+}
+
 void main() {
     uint i = gl_WorkGroupID.y * nwg_x + gl_WorkGroupID.x;
     if (i >= n_rows) {
@@ -45,22 +62,41 @@ void main() {
     uint src_row = offset_src + i3 * stride_src3 + i2 * stride_src2 + i1 * stride_src1;
     uint dst_row = offset_dst + i3 * stride_dst3 + i2 * stride_dst2 + i1 * stride_dst1;
 
+#if defined(SUM_ROWS) || defined(MEAN) || defined(NORM)
     float sum = 0.0;
     for (uint col = tid; col < ne0; col += uint(WG_SIZE)) {
-        float v = LOAD_F32(src, src_row + col);
-        sum += v * v;
+        sum += LOAD_F32(src, src_row + col);
     }
-    scratch[tid] = sum;
-    barrier();
-    for (uint off = uint(WG_SIZE) / 2u; off > 0u; off /= 2u) {
-        if (tid < off) {
-            scratch[tid] += scratch[tid + off];
-        }
-        barrier();
+    sum = wg_sum(sum);
+#endif
+#if defined(SUM_ROWS)
+    if (tid == 0u) {
+        STORE_F32(dst, dst_row, sum);
     }
-    float scale = 1.0 / sqrt(scratch[0] / float(ne0) + eps);
+#elif defined(MEAN)
+    if (tid == 0u) {
+        STORE_F32(dst, dst_row, sum / float(ne0));
+    }
+#else
+#if defined(NORM)
+    float mean = sum / float(ne0);
+#else
+    float mean = 0.0;
+#endif
+    float sum2 = 0.0;
+    for (uint col = tid; col < ne0; col += uint(WG_SIZE)) {
+        float v = LOAD_F32(src, src_row + col) - mean;
+        sum2 += v * v;
+    }
+    sum2 = wg_sum(sum2);
+#if defined(L2_NORM)
+    float scale = 1.0 / max(sqrt(sum2), eps);   // L2_NORM: x / max(||x||, eps)
+#else
+    float scale = 1.0 / sqrt(sum2 / float(ne0) + eps);
+#endif
 
     for (uint c = tid; c < ne0; c += uint(WG_SIZE)) {
-        STORE_F32(dst, dst_row + c, LOAD_F32(src, src_row + c) * scale);
+        STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c) - mean) * scale);
     }
+#endif
 }

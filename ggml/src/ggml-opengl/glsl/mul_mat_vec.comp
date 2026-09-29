@@ -6,7 +6,7 @@
 // A workgroup handles ROWS = WG_SIZE / TPR rows: TPR threads share one row and stride over k in units of
 // 4 elements for float types, one block or sub-block of 32 for quant types. The reduction is a
 // shared-memory tree inside each TPR block, so it does not depend on the subgroup size.
-// defines: SRC0_{F32,F16,Q4_0,Q8_0,Q4_K,Q6_K}, TPR (power of two, 1..WG_SIZE), SRC1_F16 (f16 columns instead of f32)
+// defines: SRC0_{F32,F16,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K}, TPR (power of two, 1..WG_SIZE), SRC1_F16 (f16 columns instead of f32)
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
 #define MAX_COLS 4
@@ -132,6 +132,63 @@ void main() {
                 }
             }
         }
+#elif defined(SRC0_Q4_1)
+        for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
+            // block (20 bytes): f16 d, f16 m, 16 bytes of nibbles; low nibbles elements 0..15, high 16..31
+            uint base = (src0_base + blk) * 20u;
+            uint w;
+            LOAD_U32_UNALIGNED(src0, base, w);
+            float d  = f16_to_f32(w);
+            float mm = f16_to_f32(w >> 16);
+            for (uint j = 0u; j < 4u; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 4u + 4u * j, q);
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byte_v = BYTE_OF(q, b);
+                    ACC(float(byte_v & 0xFu) * d + mm, blk * 32u + j * 4u + b);
+                    ACC(float(byte_v >> 4) * d + mm, blk * 32u + 16u + j * 4u + b);
+                }
+            }
+        }
+#elif defined(SRC0_Q5_0)
+        for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
+            // block (22 bytes): f16 d, 32 bits qh, 16 bytes of nibbles; element i takes bit i of qh as bit 4, minus 16
+            uint base = (src0_base + blk) * 22u;
+            uint dbits, qh;
+            LOAD_U16_UNALIGNED(src0, base, dbits);
+            LOAD_U32_UNALIGNED(src0, base + 2u, qh);
+            float d = f16_to_f32(dbits);
+            for (uint j = 0u; j < 4u; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 6u + 4u * j, q);
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byte_v = BYTE_OF(q, b);
+                    uint i      = j * 4u + b;
+                    ACC((float((byte_v & 0xFu) | (((qh >> i) & 1u) << 4)) - 16.0) * d, blk * 32u + i);
+                    ACC((float((byte_v >> 4) | (((qh >> (i + 16u)) & 1u) << 4)) - 16.0) * d, blk * 32u + 16u + i);
+                }
+            }
+        }
+#elif defined(SRC0_Q5_1)
+        for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
+            // block (24 bytes): f16 d, f16 m, 32 high bits qh, 16 bytes of nibbles; element i adds bit i of qh as bit 4
+            uint base = (src0_base + blk) * 24u;
+            uint w, qh;
+            LOAD_U32_UNALIGNED(src0, base, w);
+            LOAD_U32_UNALIGNED(src0, base + 4u, qh);
+            float d  = f16_to_f32(w);
+            float mm = f16_to_f32(w >> 16);
+            for (uint j = 0u; j < 4u; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + 8u + 4u * j, q);
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byte_v = BYTE_OF(q, b);
+                    uint i      = j * 4u + b;
+                    ACC(float((byte_v & 0xFu) | (((qh >> i) & 1u) << 4)) * d + mm, blk * 32u + i);
+                    ACC(float((byte_v >> 4) | (((qh >> (i + 16u)) & 1u) << 4)) * d + mm, blk * 32u + 16u + i);
+                }
+            }
+        }
 #elif defined(SRC0_Q4_K)
         // super-block of 256 (144 bytes): f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 128 bytes of
         // nibbles. Sub-block s (32 values): pair s/2 uses bytes 16 + 32*(s/2), low nibbles for even s, high
@@ -166,6 +223,105 @@ void main() {
                 for (uint b = 0u; b < 4u; b++) {
                     float v = dl * float((BYTE_OF(q, b) >> shift) & 0xFu) - ml;
                     ACC(v, blk * 256u + s * 32u + j * 4u + b);
+                }
+            }
+        }
+#elif defined(SRC0_Q5_K)
+        for (uint sb = lane; sb < k / 32u; sb += uint(TPR)) {
+            uint blk = sb / 8u;
+            uint s   = sb % 8u;
+            // super-block of 256 (176 bytes): f16 d, f16 dmin, 12 bytes of 6-bit scales/mins, 32 bytes qh, 128 bytes
+            // of nibbles. Sub-block s: nibbles as Q4_K (bytes 48 + 32*(s/2)); value l (0..31) takes bit s of qh byte l as bit 4.
+            uint base = (src0_base + blk) * 176u;
+            uint w;
+            LOAD_U32_UNALIGNED(src0, base, w);
+            float d    = f16_to_f32(w);
+            float dmin = f16_to_f32(w >> 16);
+            uint sc0, sc1, sc2;
+            LOAD_U32_UNALIGNED(src0, base + 4u, sc0);
+            LOAD_U32_UNALIGNED(src0, base + 8u, sc1);
+            LOAD_U32_UNALIGNED(src0, base + 12u, sc2);
+            uint sc, mn;
+            if (s < 4u) {
+                sc = BYTE_OF(sc0, s) & 63u;
+                mn = BYTE_OF(sc1, s) & 63u;
+            } else {
+                sc = (BYTE_OF(sc2, s - 4u) & 0xFu) | ((BYTE_OF(sc0, s - 4u) >> 6) << 4);
+                mn = (BYTE_OF(sc2, s - 4u) >> 4) | ((BYTE_OF(sc1, s - 4u) >> 6) << 4);
+            }
+            float dl    = d * float(sc);
+            float ml    = dmin * float(mn);
+            uint  shift = (s & 1u) * 4u;
+            uint  qbase = base + 48u + 32u * (s / 2u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint q, qh;
+                LOAD_U32_UNALIGNED(src0, qbase + 4u * j, q);
+                LOAD_U32_UNALIGNED(src0, base + 16u + 4u * j, qh);
+                for (uint b = 0u; b < 4u; b++) {
+                    uint v = ((BYTE_OF(q, b) >> shift) & 0xFu) | (((BYTE_OF(qh, b) >> s) & 1u) << 4);
+                    ACC(dl * float(v) - ml, blk * 256u + s * 32u + j * 4u + b);
+                }
+            }
+        }
+#elif defined(SRC0_Q2_K)
+        for (uint sb = lane; sb < k / 32u; sb += uint(TPR)) {
+            uint blk = sb / 8u;
+            uint s   = sb % 8u;
+            // super-block of 256 (84 bytes): 16 scale bytes (low nibble scale, high nibble min), 64 bytes of 2-bit quants,
+            // f16 d, f16 dmin. Sub-block s (32 values): bytes 16 + 32*(s/4) at bit 2*(s%4); values 0..15 use scale byte 2s,
+            // 16..31 byte 2s+1 (dequantize_row_q2_K in ggml-quants.c).
+            uint base = (src0_base + blk) * 84u;
+            uint w, scw;
+            LOAD_U32_UNALIGNED(src0, base + 80u, w);
+            LOAD_U16_UNALIGNED(src0, base + 2u * s, scw);
+            float d     = f16_to_f32(w);
+            float dmin  = f16_to_f32(w >> 16);
+            float dl0   = d * float(scw & 0xFu);
+            float ml0   = dmin * float((scw >> 4) & 0xFu);
+            float dl1   = d * float((scw >> 8) & 0xFu);
+            float ml1   = dmin * float((scw >> 12) & 0xFu);
+            uint  shift = (s % 4u) * 2u;
+            uint  qbase = base + 16u + 32u * (s / 4u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, qbase + 4u * j, q);
+                float dl = (j < 4u) ? dl0 : dl1;
+                float ml = (j < 4u) ? ml0 : ml1;
+                for (uint b = 0u; b < 4u; b++) {
+                    ACC(dl * float((BYTE_OF(q, b) >> shift) & 3u) - ml, blk * 256u + s * 32u + j * 4u + b);
+                }
+            }
+        }
+#elif defined(SRC0_Q3_K)
+        for (uint sb = lane; sb < k / 32u; sb += uint(TPR)) {
+            uint blk = sb / 8u;
+            uint s   = sb % 8u;
+            // super-block of 256 (110 bytes): 32 bytes hmask, 64 bytes of 2-bit quants, 12 bytes of 6-bit scales, f16 d.
+            // Sub-block s: quants as Q2_K (bytes 32 + 32*(s/4) at bit 2*(s%4)); value l subtracts 4 unless bit s of hmask
+            // byte l is set. Scale i (2s for values 0..15, 2s+1 for 16..31): low 4 bits from scale byte i%8 at bit 4*(i/8),
+            // high 2 bits from byte 8 + i%4 at bit 2*(i/4), minus 32 (dequantize_row_q3_K in ggml-quants.c).
+            uint base = (src0_base + blk) * 110u;
+            uint dbits, lo0, lo1, hi0, hi1;
+            LOAD_U16_UNALIGNED(src0, base + 108u, dbits);
+            uint i0 = 2u * s;
+            uint i1 = 2u * s + 1u;
+            LOAD_U32_UNALIGNED(src0, base + 96u + i0 % 8u, lo0);
+            LOAD_U32_UNALIGNED(src0, base + 96u + i1 % 8u, lo1);
+            LOAD_U32_UNALIGNED(src0, base + 104u + i0 % 4u, hi0);
+            LOAD_U32_UNALIGNED(src0, base + 104u + i1 % 4u, hi1);
+            float d     = f16_to_f32(dbits);
+            float dl0   = d * float(int(((lo0 >> (4u * (i0 / 8u))) & 0xFu) | (((hi0 >> (2u * (i0 / 4u))) & 3u) << 4)) - 32);
+            float dl1   = d * float(int(((lo1 >> (4u * (i1 / 8u))) & 0xFu) | (((hi1 >> (2u * (i1 / 4u))) & 3u) << 4)) - 32);
+            uint  shift = (s % 4u) * 2u;
+            uint  qbase = base + 32u + 32u * (s / 4u);
+            for (uint j = 0u; j < 8u; j++) {
+                uint q, hm;
+                LOAD_U32_UNALIGNED(src0, qbase + 4u * j, q);
+                LOAD_U32_UNALIGNED(src0, base + 4u * j, hm);
+                float dl = (j < 4u) ? dl0 : dl1;
+                for (uint b = 0u; b < 4u; b++) {
+                    int v = int((BYTE_OF(q, b) >> shift) & 3u) - ((((BYTE_OF(hm, b) >> s) & 1u) != 0u) ? 0 : 4);
+                    ACC(dl * float(v), blk * 256u + s * 32u + j * 4u + b);
                 }
             }
         }

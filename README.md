@@ -1,4 +1,13 @@
-# llama.cpp
+# llama.cpp - OpenGL backend
+
+> **This is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with an OpenGL 4.3 compute backend.**
+> It runs LLMs on Windows GPUs through their OpenGL driver, including GPUs without Vulkan, CUDA or ROCm support.
+>
+> - **Download:** Windows x64 zips on the [releases page](https://github.com/koza-coder/llama.cpp-opengl/releases)
+> - **Build, test, settings:** [docs/backend/OPENGL.md](docs/backend/OPENGL.md)
+> - **Backend source:** [ggml/src/ggml-opengl](ggml/src/ggml-opengl)
+>
+> Everything below is the upstream llama.cpp README.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

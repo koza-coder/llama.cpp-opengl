@@ -46,6 +46,7 @@
 #define GGML_GL_MAX_WG_PER_DIM       65535
 #define GGML_GL_BINDING_ALIGNMENT    256   // minimum tensor binding alignment; raised to the driver's SSBO offset alignment
 #define GGML_GL_PARAM_SLOT_SIZE      256
+#define GGML_GL_FLASH_ATTN_TMP_MAX   (64ull * 1024 * 1024)   // cap on the block results buffer
 #define GGML_GL_PARAM_SLOT_COUNT     1024
 #define GGML_GL_BUFFER_SLACK         256   // past the end of every buffer: unaligned loads read one word further
 
@@ -217,6 +218,9 @@ struct gl_device_ctx {
     uint32_t tiled_min_cols = GGML_GL_TILED_DEFAULT;
 
     GLuint   ubo       = 0;   // kernel parameters, one slot per dispatch, reused round robin
+
+    GLuint   fa_tmp      = 0;   // flash attention block results, grown on demand
+    size_t   fa_tmp_size = 0;
     uint32_t next_slot = 0;
 
     std::unordered_map<std::string, gl_pipeline> pipelines;
@@ -696,9 +700,15 @@ static std::string ggml_opengl_type_define(ggml_type type, const char * prefix) 
         case GGML_TYPE_F16: s += "_F16"; break;
         case GGML_TYPE_I32: s += "_I32"; break;
         case GGML_TYPE_Q4_0: s += "_Q4_0"; break;
+        case GGML_TYPE_Q4_1: s += "_Q4_1"; break;
+        case GGML_TYPE_Q5_0: s += "_Q5_0"; break;
+        case GGML_TYPE_Q5_1: s += "_Q5_1"; break;
+        case GGML_TYPE_Q5_K: s += "_Q5_K"; break;
         case GGML_TYPE_Q4_K: s += "_Q4_K"; break;
         case GGML_TYPE_Q8_0: s += "_Q8_0"; break;
         case GGML_TYPE_Q6_K: s += "_Q6_K"; break;
+        case GGML_TYPE_Q2_K: s += "_Q2_K"; break;
+        case GGML_TYPE_Q3_K: s += "_Q3_K"; break;
         default: GGML_ABORT("ggml_opengl: unsupported type %s", ggml_type_name(type));
     }
     return s;
@@ -725,7 +735,7 @@ static void ggml_opengl_cpy(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor 
 }
 
 static void ggml_opengl_binary_op(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
-    const char * op_define = dst->op == GGML_OP_ADD ? "OP_ADD" : "OP_MUL";
+    const std::string op_define = std::string("OP_") + ggml_op_name(dst->op);   // OP_ADD, OP_SUB, OP_MUL, OP_DIV
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "binary", glsl_binary,
                                                       { ggml_opengl_type_define(dst->type, "TYPE"), op_define });
 
@@ -766,8 +776,174 @@ static void ggml_opengl_scale(gl_device_ctx & dev, ggml_tensor * src, ggml_tenso
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
 
+static void ggml_opengl_concat(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "concat", glsl_concat, {});
+
+    const gl_binding b0  = ggml_opengl_bind_tensor(dev, src0);
+    const gl_binding b1  = ggml_opengl_bind_tensor(dev, src1);
+    const gl_binding bd  = ggml_opengl_bind_tensor(dev, dst);
+    const int32_t    dim = ggml_get_op_params_i32(dst, 0);
+    const uint32_t   ne  = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[0] / 4), (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
+        (uint32_t) (src1->nb[0] / 4), (uint32_t) (src1->nb[1] / 4), (uint32_t) (src1->nb[2] / 4), (uint32_t) (src1->nb[3] / 4),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        ne, (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) dim, (uint32_t) src0->ne[dim],
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+static void ggml_opengl_pad(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (ggml_get_op_params_i32(dst, 8) != 0) {
+        defines.push_back("CIRCULAR");
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "pad", glsl_pad, defines);
+
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   ne = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[0] / 4), (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
+        (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
+        (uint32_t) ggml_get_op_params_i32(dst, 4), (uint32_t) ggml_get_op_params_i32(dst, 6),
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+static void ggml_opengl_ssm_conv(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "ssm_conv", glsl_ssm_conv, {});
+
+    const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
+    const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   ne = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src1->nb[1] / 4),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        (uint32_t) src1->ne[0], (uint32_t) src0->ne[1], (uint32_t) dst->ne[1], ne,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+static bool ggml_opengl_unary_supported(ggml_unary_op op) {
+    switch (op) {
+        case GGML_UNARY_OP_ABS: case GGML_UNARY_OP_SGN: case GGML_UNARY_OP_NEG: case GGML_UNARY_OP_STEP:
+        case GGML_UNARY_OP_TANH: case GGML_UNARY_OP_ELU: case GGML_UNARY_OP_RELU: case GGML_UNARY_OP_SIGMOID:
+        case GGML_UNARY_OP_GELU: case GGML_UNARY_OP_GELU_QUICK: case GGML_UNARY_OP_GELU_ERF: case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_HARDSWISH: case GGML_UNARY_OP_HARDSIGMOID: case GGML_UNARY_OP_EXP: case GGML_UNARY_OP_SOFTPLUS:
+        case GGML_UNARY_OP_EXPM1: case GGML_UNARY_OP_FLOOR: case GGML_UNARY_OP_CEIL: case GGML_UNARY_OP_ROUND:
+        case GGML_UNARY_OP_TRUNC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// GGML_OP_UNARY and the standalone element-wise ops (CLAMP, SQR, SQRT, SIN, COS, LOG): the op name is the define
+static void ggml_opengl_unary(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    const char *  op_define = dst->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(dst)) : ggml_op_name(dst->op);
+    gl_pipeline & pipeline  = ggml_opengl_get_pipeline(dev, "unary", glsl_unary, { ggml_opengl_type_define(dst->type, "TYPE"), op_define });
+    const bool    clamp     = dst->op == GGML_OP_CLAMP;
+
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const size_t     ts = ggml_type_size(src->type);
+    const uint32_t   ne = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        ne, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
+        clamp ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 0)) : 0u,   // clamp min
+        clamp ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 1)) : 0u,   // clamp max
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+static void ggml_opengl_repeat(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "repeat", glsl_repeat, {});
+
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   ne = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[0] / 4), (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+// one workgroup per state row (see gated_delta_net.comp), all tokens in one dispatch
+static void ggml_opengl_gated_delta_net(gl_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * q = dst->src[0];
+    ggml_tensor * k = dst->src[1];
+    ggml_tensor * v = dst->src[2];
+    ggml_tensor * g = dst->src[3];
+    ggml_tensor * b = dst->src[4];
+    ggml_tensor * s = dst->src[5];
+
+    const uint32_t S_v      = (uint32_t) v->ne[0];
+    const uint32_t H        = (uint32_t) v->ne[1];
+    const uint32_t n_tokens = (uint32_t) v->ne[2];
+    const uint32_t n_seqs   = (uint32_t) v->ne[3];
+    const uint32_t K        = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    uint32_t       red      = 1;
+    while (red < S_v) {
+        red *= 2;
+    }
+
+    std::vector<std::string> defines = { "S_V=" + std::to_string(S_v), "RED=" + std::to_string(red) };
+    if (g->ne[0] == S_v) {
+        defines.push_back("KDA");
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "gated_delta_net", glsl_gated_delta_net, defines);
+
+    const gl_binding bq = ggml_opengl_bind_tensor(dev, q);
+    const gl_binding bk = ggml_opengl_bind_tensor(dev, k);
+    const gl_binding bv = ggml_opengl_bind_tensor(dev, v);
+    const gl_binding bg = ggml_opengl_bind_tensor(dev, g);
+    const gl_binding bb = ggml_opengl_bind_tensor(dev, b);
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, s);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   n_rows = n_seqs * H * S_v;
+
+    std::vector<uint32_t> params = {
+        bq.elem_offset, bk.elem_offset, bv.elem_offset, bg.elem_offset, bb.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) (q->nb[1] / 4), (uint32_t) (q->nb[2] / 4), (uint32_t) (q->nb[3] / 4),
+        (uint32_t) (k->nb[1] / 4), (uint32_t) (k->nb[2] / 4), (uint32_t) (k->nb[3] / 4),
+        (uint32_t) (v->nb[1] / 4), (uint32_t) (v->nb[2] / 4), (uint32_t) (v->nb[3] / 4),
+        (uint32_t) (g->nb[1] / 4), (uint32_t) (g->nb[2] / 4), (uint32_t) (g->nb[3] / 4),
+        (uint32_t) (b->nb[1] / 4), (uint32_t) (b->nb[2] / 4), (uint32_t) (b->nb[3] / 4),
+        H, n_tokens, (uint32_t) q->ne[1], (uint32_t) k->ne[1],
+        (uint32_t) (v->ne[3] / q->ne[3]), (uint32_t) (v->ne[3] / k->ne[3]),
+        (uint32_t) (s->nb[3] / 4), K,
+        n_rows, ggml_opengl_u32_from_f32(1.0f / sqrtf((float) S_v)),
+        bd.elem_offset + S_v * H * n_tokens * n_seqs, S_v * S_v * H * n_seqs,   // offset_st, st_slot_stride
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bq, bk, bv, bg, bb, bs, bd }, n_rows);
+}
+
+// RMS_NORM, and with the op name as define L2_NORM, NORM, SUM_ROWS, MEAN (all one workgroup per row)
 static void ggml_opengl_rms_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "rms_norm", glsl_rms_norm, {});
+    std::vector<std::string> defines;
+    if (dst->op != GGML_OP_RMS_NORM) {
+        defines.push_back(ggml_op_name(dst->op));
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "rms_norm", glsl_rms_norm, defines);
 
     const gl_binding bs     = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd     = ggml_opengl_bind_tensor(dev, dst);
@@ -929,7 +1105,138 @@ static void ggml_opengl_rope(gl_device_ctx & dev, ggml_tensor * src0, ggml_tenso
     ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, b2, bd }, CEIL_DIV(n_threads, (uint32_t) GGML_GL_WG_SIZE));
 }
 
+// FLASH_ATTN_EXT in two passes (block results, then combine); see flash_attn.comp. Port of the D3D11 encoder
+// without its work-per-submit chunking: rows are split only by the size of the block results buffer.
+static void ggml_opengl_flash_attn_ext(gl_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * q     = dst->src[0];
+    ggml_tensor * k     = dst->src[1];
+    ggml_tensor * v     = dst->src[2];
+    ggml_tensor * mask  = dst->src[3];
+    ggml_tensor * sinks = dst->src[4];
+
+    float       scale         = ggml_get_op_params_f32(dst, 0);
+    const float max_bias      = ggml_get_op_params_f32(dst, 1);
+    const float logit_softcap = ggml_get_op_params_f32(dst, 2);
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    std::vector<std::string> defines = {
+        "DK=" + std::to_string(k->ne[0]), "DV=" + std::to_string(v->ne[0]),
+        k->type == GGML_TYPE_F16 ? "K_F16" : k->type == GGML_TYPE_Q8_0 ? "K_Q8_0" : "K_F32",
+        v->type == GGML_TYPE_F16 ? "V_F16" : v->type == GGML_TYPE_Q8_0 ? "V_Q8_0" : "V_F32",
+    };
+    if (mask) {
+        defines.push_back("HAS_MASK");
+    }
+    if (sinks) {
+        defines.push_back("HAS_SINKS");
+    }
+    if (logit_softcap != 0.0f) {
+        defines.push_back("SOFTCAP");
+    }
+    // pass 1 runs a workgroup per row and block of WG_SIZE KV entries: a thread per row with DV/4 vec4
+    // accumulators each was wrong at head size >= 128 on the AMD GL compiler (exp27) or crashed it (exp28-exp30)
+    const uint32_t blk = GGML_GL_WG_SIZE;
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "flash_attn", glsl_flash_attn, defines);
+
+    std::vector<std::string> combine_defines = { "DV=" + std::to_string(v->ne[0]), "COMBINE" };
+    if (sinks) {
+        combine_defines.push_back("HAS_SINKS");
+    }
+    gl_pipeline & combine = ggml_opengl_get_pipeline(dev, "flash_attn", glsl_flash_attn, combine_defines);
+
+    // a missing mask or sinks tensor: q is bound in its slot and never read
+    const gl_binding bq = ggml_opengl_bind_tensor(dev, q);
+    const gl_binding bk = ggml_opengl_bind_tensor(dev, k);
+    const gl_binding bv = ggml_opengl_bind_tensor(dev, v);
+    const gl_binding bm = ggml_opengl_bind_tensor(dev, mask ? mask : q);
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, sinks ? sinks : q);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const size_t     tk = ggml_type_size(k->type);
+    const size_t     tv = ggml_type_size(v->type);
+
+    const uint32_t n_head      = (uint32_t) q->ne[2];
+    const float    n_head_log2 = (float) (1u << (uint32_t) floor(log2((double) n_head)));
+    const float    m0          = powf(2.0f, -(max_bias) / n_head_log2);
+    const float    m1          = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    const uint32_t n_kv        = (uint32_t) k->ne[1];
+    const uint32_t n_blocks    = CEIL_DIV(n_kv, blk);
+
+    std::vector<uint32_t> params = {
+        bq.elem_offset, bk.elem_offset, bv.elem_offset, mask ? bm.elem_offset : 0u, sinks ? bs.elem_offset : 0u, bd.elem_offset,
+        (uint32_t) (q->nb[1] / 4), (uint32_t) (q->nb[2] / 4), (uint32_t) (q->nb[3] / 4),
+        (uint32_t) (k->nb[1] / tk), (uint32_t) (k->nb[2] / tk), (uint32_t) (k->nb[3] / tk),
+        (uint32_t) (v->nb[1] / tv), (uint32_t) (v->nb[2] / tv), (uint32_t) (v->nb[3] / tv),
+        mask ? (uint32_t) (mask->nb[1] / 2) : 0u, mask ? (uint32_t) (mask->nb[2] / 2) : 0u, mask ? (uint32_t) (mask->nb[3] / 2) : 0u,
+        mask ? (uint32_t) mask->ne[2] : 1u, mask ? (uint32_t) mask->ne[3] : 1u,
+        (uint32_t) q->ne[1], n_head, n_kv,
+        (uint32_t) (q->ne[2] / k->ne[2]), (uint32_t) (q->ne[3] / k->ne[3]),
+        (uint32_t) (q->ne[2] / v->ne[2]), (uint32_t) (q->ne[3] / v->ne[3]),
+        ggml_opengl_u32_from_f32(scale), ggml_opengl_u32_from_f32(max_bias), ggml_opengl_u32_from_f32(logit_softcap),
+        ggml_opengl_u32_from_f32(n_head_log2), ggml_opengl_u32_from_f32(m0), ggml_opengl_u32_from_f32(m1),
+        blk, n_blocks, 0, 0,   // blk_size, n_blocks, row0, n_rows
+    };
+    const size_t row0_idx = params.size() - 2;
+
+    const uint64_t n_rows    = (uint64_t) ggml_nrows(dst);   // dst is [DV, n_head, n_q, n_batch]
+    const uint64_t row_bytes = (uint64_t) n_blocks * (uint64_t) (v->ne[0] + 1) * sizeof(float);
+    const uint64_t tmp_rows  = std::max<uint64_t>(1, GGML_GL_FLASH_ATTN_TMP_MAX / row_bytes);
+    const size_t   tmp_need  = (size_t) (std::min(tmp_rows, n_rows) * row_bytes);
+    if (dev.fa_tmp_size < tmp_need) {
+        // GL keeps a deleted buffer alive until the dispatches that use it are done
+        if (dev.fa_tmp) {
+            p_glDeleteBuffers(1, &dev.fa_tmp);
+        }
+        size_t size = 1ull << 20;
+        while (size < tmp_need) {
+            size *= 2;
+        }
+        p_glGenBuffers(1, &dev.fa_tmp);
+        p_glBindBuffer(E_COPY_WRITE_BUFFER, dev.fa_tmp);
+        p_glBufferData(E_COPY_WRITE_BUFFER, (ptrdiff_t) size, nullptr, E_DYNAMIC_COPY);
+        dev.fa_tmp_size = size;
+    }
+    const gl_binding bt = { dev.fa_tmp, 0, dev.fa_tmp_size, 0 };
+
+    for (uint64_t row0 = 0, n = 0; row0 < n_rows; row0 += n) {
+        n = std::min(n_rows - row0, tmp_rows);
+        params[row0_idx]     = (uint32_t) row0;
+        params[row0_idx + 1] = (uint32_t) n;
+        ggml_opengl_dispatch(dev, pipeline, params, { bq, bk, bv, bm, bs, bd, bt },
+                             (uint32_t) n * n_blocks);
+        ggml_opengl_dispatch(dev, combine, params, { bq, bk, bv, bm, bs, bd, bt }, CEIL_DIV((uint32_t) n, (uint32_t) GGML_GL_WG_SIZE));
+    }
+}
+
+// GET_ROWS of a quantized source: the dequant paths of the matrix-vector kernel, TPR threads per row
+static void ggml_opengl_get_rows_quant(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+    const uint32_t tpr      = 16;
+    gl_pipeline &  pipeline = ggml_opengl_get_pipeline(dev, "get_rows_q", glsl_get_rows_q,
+                                                       { ggml_opengl_type_define(src->type, "SRC0"), "TPR=" + std::to_string(tpr) });
+
+    const gl_binding bs     = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bi     = ggml_opengl_bind_tensor(dev, idx);
+    const gl_binding bd     = ggml_opengl_bind_tensor(dev, dst);
+    const size_t     ts     = ggml_type_size(src->type);
+    const size_t     td     = ggml_type_size(dst->type);
+    const uint32_t   n_rows = (uint32_t) ggml_nrows(dst);
+
+    std::vector<uint32_t> params = {
+        bs.elem_offset, bi.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
+        (uint32_t) (idx->nb[0] / 4), (uint32_t) (idx->nb[1] / 4), (uint32_t) (idx->nb[2] / 4),
+        (uint32_t) (dst->nb[1] / td), (uint32_t) (dst->nb[2] / td), (uint32_t) (dst->nb[3] / td),
+        (uint32_t) dst->ne[0], (uint32_t) idx->ne[0], (uint32_t) idx->ne[1], n_rows,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bi, bd }, CEIL_DIV(n_rows * tpr, (uint32_t) GGML_GL_WG_SIZE));
+}
+
 static void ggml_opengl_get_rows(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+    if (ggml_is_quantized(src->type)) {
+        ggml_opengl_get_rows_quant(dev, src, idx, dst);
+        return;
+    }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "get_rows", glsl_get_rows, { ggml_opengl_type_define(src->type, "SRC") });
 
     const gl_binding bs      = ggml_opengl_bind_tensor(dev, src);
@@ -1038,7 +1345,9 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
             ggml_opengl_cpy(dev, node->src[0], node);
             return;
         case GGML_OP_ADD:
+        case GGML_OP_SUB:
         case GGML_OP_MUL:
+        case GGML_OP_DIV:
             ggml_opengl_binary_op(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_SCALE:
@@ -1048,7 +1357,35 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
             ggml_opengl_get_rows(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_RMS_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
             ggml_opengl_rms_norm(dev, node->src[0], node);
+            return;
+        case GGML_OP_CONCAT:
+            ggml_opengl_concat(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_UNARY:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_LOG:
+            ggml_opengl_unary(dev, node->src[0], node);
+            return;
+        case GGML_OP_REPEAT:
+            ggml_opengl_repeat(dev, node->src[0], node);
+            return;
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_opengl_gated_delta_net(dev, node);
+            return;
+        case GGML_OP_PAD:
+            ggml_opengl_pad(dev, node->src[0], node);
+            return;
+        case GGML_OP_SSM_CONV:
+            ggml_opengl_ssm_conv(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_GLU:
             ggml_opengl_glu(dev, node->src[0], node->src[1], node);
@@ -1064,6 +1401,9 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
             return;
         case GGML_OP_MUL_MAT:
             ggml_opengl_mul_mat(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_opengl_flash_attn_ext(dev, node);
             return;
         default:
             GGML_ABORT("ggml_opengl: unsupported op %s", ggml_op_name(node->op));
@@ -1408,13 +1748,55 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_DUP:
             return type_ok(op->type) && type_ok(src0->type);
         case GGML_OP_ADD:
+        case GGML_OP_SUB:
         case GGML_OP_MUL:
+        case GGML_OP_DIV:
             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                    src0->type == op->type && src1->type == op->type;
         case GGML_OP_SCALE:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
         case GGML_OP_RMS_NORM:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float);
+        case GGML_OP_CLAMP:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_LOG:
+            return src0->type == op->type && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   ggml_is_contiguous(op);
+        case GGML_OP_CONCAT:
+            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32) && src0->type == op->type &&
+                   src1->type == op->type;
+        case GGML_OP_UNARY:
+            // the kernel writes dst by flat index
+            return ggml_opengl_unary_supported(ggml_get_unary_op(op)) && src0->type == op->type &&
+                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
+        case GGML_OP_REPEAT:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                // f32 everywhere, rows of S_v (<= 512, one workgroup) elements, q/k head size equal to S_v
+                const ggml_tensor * v = op->src[2];
+                bool ok = op->type == GGML_TYPE_F32 && v->ne[0] <= 512 &&
+                          op->src[0]->ne[0] == v->ne[0] && op->src[1]->ne[0] == v->ne[0];
+                for (int i = 0; i < 6; i++) {
+                    ok = ok && op->src[i]->type == GGML_TYPE_F32 && op->src[i]->nb[0] == sizeof(float);
+                }
+                return ok;
+            }
+        case GGML_OP_PAD:
+            // dst is addressed by a flat index, as the CPU does; src keeps its strides
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+        case GGML_OP_SSM_CONV:
+            // same layout requirements as the CPU kernel
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) &&
+                   src0->nb[1] == src0->ne[0] * sizeof(float) && src1->nb[1] == src1->ne[0] * sizeof(float);
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU: case GGML_GLU_OP_GEGLU: case GGML_GLU_OP_SWIGLU:
@@ -1434,6 +1816,26 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
                    (!src1 || src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                // f32/f16/q8_0 KV, f16 mask, head sizes up to 576 and multiples of 4 (32 for q8_0); contiguous
+                // rows and a contiguous dst
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * m = op->src[3];
+                const ggml_tensor * s = op->src[4];
+                auto kv_ok = [](const ggml_tensor * t) {
+                    if (t->type == GGML_TYPE_Q8_0) {
+                        return t->ne[0] <= 576 && t->ne[0] % 32 == 0 && t->nb[1] % ggml_type_size(t->type) == 0 &&
+                               t->nb[2] % ggml_type_size(t->type) == 0 && t->nb[3] % ggml_type_size(t->type) == 0;
+                    }
+                    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && t->nb[0] == ggml_type_size(t->type) &&
+                           t->ne[0] <= 576 && t->ne[0] % 4 == 0;
+                };
+                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
+                       kv_ok(k) && kv_ok(v) && (!m || (m->type == GGML_TYPE_F16 && m->nb[0] == 2)) &&
+                       (!s || s->type == GGML_TYPE_F32) && ggml_is_contiguous(op);
+            }
         case GGML_OP_SET_ROWS:
             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && src0->type == GGML_TYPE_F32 &&
                    (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
@@ -1445,16 +1847,25 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_F32:
                 case GGML_TYPE_F16:
                     return op->type == GGML_TYPE_F32;
+                case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+                case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+                case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
+                    // whole blocks per row, as the matrix-vector kernel reads them
+                    return op->type == GGML_TYPE_F32 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
+                           src0->nb[1] % ggml_type_size(src0->type) == 0 && src0->nb[2] % ggml_type_size(src0->type) == 0 &&
+                           src0->nb[3] % ggml_type_size(src0->type) == 0;
                 case GGML_TYPE_I32:
                     return op->type == GGML_TYPE_I32;
                 default:
                     return false;
             }
         case GGML_OP_MUL_MAT:
-            // contiguous rows. Float weights: k in units of 4, f32 or f16 columns. Q4_0 / Q8_0 / Q4_K / Q6_K
-            // weights: whole blocks, f32 columns
-            if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
-                src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) {
+            // contiguous rows. Float weights: k in units of 4, f32 or f16 columns. Q4_0 / Q4_1 / Q5_0 / Q5_1 /
+            // Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K weights: whole blocks, f32 columns
+            if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
+                src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K ||
+                src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
+                src0->type == GGML_TYPE_Q2_K || src0->type == GGML_TYPE_Q3_K) {
                 return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        src0->ne[0] % ggml_blck_size(src0->type) == 0;
@@ -1634,6 +2045,11 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     }
     dev.desc    = (const char *) glGetString(GL_RENDERER);
     dev.version = (const char *) glGetString(GL_VERSION);
+    // Moore Threads: the driver's compiler aborts on the tiled matmul's barriers, with a runtime or a constant loop
+    // bound ("LLVM ERROR: barrierOp in dynamic branch", exp43/exp44), so all matmuls use the mat-vec kernel there
+    if (dev.desc.find("Moore Threads") != std::string::npos) {
+        dev.tiled_min_cols = 0;
+    }
 
     std::map<std::string, bool> exts;
     GLint n_ext = 0;
@@ -1736,6 +2152,16 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     return true;
 }
 
+static int __cdecl ggml_opengl_process_exit() {
+    if (g_reg_ctx) {
+        for (auto & dev : g_reg_ctx->devs) {
+            std::lock_guard<std::recursive_mutex> lock(dev->mutex);
+            ggml_opengl_destroy_context(*dev);
+        }
+    }
+    return 0;
+}
+
 static void ggml_opengl_enumerate(ggml_backend_opengl_reg_context & reg_ctx, ggml_backend_reg_t reg) {
     // WGL gives one context on the driver of the primary display: one device
     auto dev  = std::make_shared<gl_device_ctx>();
@@ -1750,6 +2176,17 @@ static void ggml_opengl_enumerate(ggml_backend_opengl_reg_context & reg_ctx, ggm
     if (!ggml_opengl_init_device(*dev, &reg_ctx.devices.back())) {
         reg_ctx.devices.clear();
         reg_ctx.devs.clear();
+        return;
+    }
+    // At ExitProcess the loader detaches the ICD (loaded last) before OPENGL32, whose own detach then cleans up
+    // live contexts through the detached ICD: a call to 0 on the MTT S80 (exp33). Delete the contexts in the
+    // process exit handlers instead, which run before ExitProcess; a DLL's own atexit only runs at its detach.
+    // Pin this DLL so the handler cannot outlive it.
+    HMODULE self = nullptr;
+    auto crt_onexit = (_onexit_t (__cdecl *)(_onexit_t)) (void *) GetProcAddress(GetModuleHandleA("msvcrt.dll"), "_onexit");
+    if (crt_onexit && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                                         (LPCSTR) &ggml_opengl_process_exit, &self)) {
+        crt_onexit(ggml_opengl_process_exit);
     }
 }
 
