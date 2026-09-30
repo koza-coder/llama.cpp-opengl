@@ -5,7 +5,8 @@ driver offers an OpenGL 4.3 (or newer) core context, including GPUs without Vulk
 
 - Backend source: [ggml/src/ggml-opengl](../../ggml/src/ggml-opengl) (host code `ggml-opengl.cpp`, GLSL compute shaders in `glsl/`)
 - Device name in llama.cpp: `OpenGL0`, `OpenGL1`, ...
-- Platform: Windows x64 (WGL). Linux/EGL is not implemented.
+- Platform: Windows x64 (WGL). A Linux build (surfaceless EGL) compiles and passes the op tests on Mesa llvmpipe;
+  it has not been tested on a Linux GPU yet.
 
 ## Status
 
@@ -79,5 +80,9 @@ Compares every supported op against the CPU backend. `-o MUL_MAT` (or any op nam
 | `GGML_OPENGL_MAX_ALLOC_MB=<n>` | cap the size of one GPU buffer |
 | `GGML_OPENGL_STATS` | print counters (graphs, dispatches, barriers, graph time, shader compiles vs. cache hits, transfers) |
 | `GGML_OPENGL_DEBUG` | enable the GL debug output callback (when the driver provides a debug context) |
+| `GGML_OPENGL_PROFILE` | GPU time per shader from timer queries, printed at exit with the STATS line (slows every dispatch) |
+| `GGML_OPENGL_NO_FUSE` | do not fuse RMS_NORM + MUL and mat-vec MUL_MAT + bias ADD |
+| `GGML_OPENGL_PARAM_PERSIST=0` | write dispatch parameters with glBufferSubData instead of the persistent mapped ring |
+| `GGML_OPENGL_MAX_TPR=<n>` | cap the matrix-vector threads per row (power of two, default 256) |
 
 The first run compiles the shaders; later runs load them from the disk cache.

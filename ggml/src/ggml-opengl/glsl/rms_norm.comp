@@ -1,13 +1,17 @@
 #include "common.glsl"
 
-// Port of the D3D11 rms_norm.hlsl without the fusions. f32 only, one workgroup per row:
+// Port of the D3D11 rms_norm.hlsl. f32 only, one workgroup per row:
 // dst = src * rsqrt(mean(src^2) + eps); with L2_NORM dst = src / max(sqrt(sum(src^2)), eps);
-// with NORM dst = (src - mean) * rsqrt(mean((src - mean)^2) + eps); with SUM_ROWS / MEAN dst[row] = sum / mean of the row
+// with NORM dst = (src - mean) * rsqrt(mean((src - mean)^2) + eps); with SUM_ROWS / MEAN dst[row] = sum / mean of the row;
+// with MUL_W (RMS_NORM fused with the following MUL) the result is also multiplied by one weight row w[col]
 
 layout(local_size_x = WG_SIZE) in;
 
 layout(std430, binding = 0) buffer Src { uint src[]; };
 layout(std430, binding = 1) buffer Dst { uint dst[]; };
+#if defined(MUL_W)
+layout(std430, binding = 2) buffer W { uint w[]; };
+#endif
 
 layout(std140, binding = 0) uniform Params {
     uint offset_src;
@@ -27,6 +31,7 @@ layout(std140, binding = 0) uniform Params {
     uint n_rows;
 
     float eps;
+    uint  offset_w;
 
     uint nwg_x;
 };
@@ -96,7 +101,14 @@ void main() {
 #endif
 
     for (uint c = tid; c < ne0; c += uint(WG_SIZE)) {
+#if defined(MUL_W)
+        // two roundings as in the unfused RMS_NORM then MUL; precise keeps the compiler from contracting them
+        precise float y = (LOAD_F32(src, src_row + c) - mean) * scale;
+        y = y * LOAD_F32(w, offset_w + c);
+        STORE_F32(dst, dst_row + c, y);
+#else
         STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c) - mean) * scale);
+#endif
     }
 #endif
 }

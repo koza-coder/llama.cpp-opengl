@@ -628,6 +628,23 @@ void load_a_row(uint row_base, uint k0, uint col) {
             Atile[blk * 128u + s * 32u + j - k0][col] = ((q >> j) & 1u) != 0u ? d : -d;
         }
     }
+#elif defined(SRC0_Q2_0)
+    // block of 64 (18 bytes): f16 d, 16 bytes of 2-bit codes q (4 per byte, low bits first); value = (q - 1) * d
+    {
+        uint sb = k0 / 32u;
+        uint blk  = sb / 2u;
+        uint s    = sb % 2u;
+        uint base = (row_base + blk) * 18u;
+        uint dbits, q0, q1;
+        LOAD_U16_UNALIGNED(src0, base, dbits);
+        LOAD_U32_UNALIGNED(src0, base + 2u + 8u * s, q0);
+        LOAD_U32_UNALIGNED(src0, base + 6u + 8u * s, q1);
+        float d = f16_to_f32(dbits);
+        for (uint j = 0u; j < 16u; j++) {
+            Atile[blk * 64u + s * 32u + j - k0][col] = (float((q0 >> (2u * j)) & 3u) - 1.0) * d;
+            Atile[blk * 64u + s * 32u + 16u + j - k0][col] = (float((q1 >> (2u * j)) & 3u) - 1.0) * d;
+        }
+    }
 #endif
 }
 

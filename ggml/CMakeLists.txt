@@ -232,7 +232,7 @@ option(GGML_WEBGPU_DEBUG                    "ggml: enable WebGPU debug output"  
 option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)"             OFF)
 option(GGML_WEBGPU_GPU_PROFILE              "ggml: enable WebGPU profiling (GPU)"             OFF)
 option(GGML_WEBGPU_JSPI                     "ggml: use JSPI for WebGPU"                       ON)
-option(GGML_OPENGL                          "ggml: use OpenGL 4.3 compute (Windows/WGL)"      OFF)
+option(GGML_OPENGL                          "ggml: use OpenGL 4.3 compute (WGL or EGL)"        OFF)
 option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
 option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer API Remoting frontend"     OFF)
 option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
