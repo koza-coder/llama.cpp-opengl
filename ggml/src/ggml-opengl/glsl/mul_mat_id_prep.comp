@@ -1,0 +1,78 @@
+#include "common.glsl"
+
+// Groups the (token, slot) pairs of a mul_mat_id by expert, for the tiled kernel (mul_mat_tiled.comp, MMID).
+// Port of the D3D11 mul_mat_id_prep.hlsl. One workgroup. Output in scratch, in uints:
+//   [0]                     number of tiles
+//   [1 + 3 t .. 3 + 3 t]    tile t: expert, first list entry, column count (1..32)
+//   [list_base + i]         pair index token * n_used + slot, grouped by expert
+// Like the list that mm_ids_helper makes in the CUDA backend. The order inside an expert is not fixed;
+// every column is computed on its own, so the result does not depend on it.
+
+#define MAX_EXPERTS 1024
+#define COLS_PER_TILE 32u
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Ids     { uint ids[]; };
+layout(std430, binding = 1) buffer Scratch { uint scratch[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_ids;
+    uint ids_s1;      // ids->nb[1] in elements
+    uint n_used;      // ids->ne[0]
+    uint n_tokens;    // ids->ne[1]
+    uint n_experts;   // at most MAX_EXPERTS
+    uint list_base;
+    uint nwg_x;
+};
+
+shared uint counts[MAX_EXPERTS];
+shared uint starts[MAX_EXPERTS];
+
+void main() {
+    uint tid     = gl_LocalInvocationID.x;
+    uint n_pairs = n_used * n_tokens;
+
+    for (uint e = tid; e < n_experts; e += uint(WG_SIZE)) {
+        counts[e] = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    for (uint p = tid; p < n_pairs; p += uint(WG_SIZE)) {
+        uint e = ids[offset_ids + (p / n_used) * ids_s1 + p % n_used];
+        if (e < n_experts) {
+            atomicAdd(counts[e], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // one thread: list start of each expert, and the tile table
+    if (tid == 0u) {
+        uint pos   = 0u;
+        uint tiles = 0u;
+        for (uint e = 0u; e < n_experts; e++) {
+            uint c    = counts[e];
+            starts[e] = pos;
+            for (uint c0 = 0u; c0 < c; c0 += COLS_PER_TILE) {
+                scratch[1u + 3u * tiles]      = e;
+                scratch[1u + 3u * tiles + 1u] = pos + c0;
+                scratch[1u + 3u * tiles + 2u] = min(c - c0, COLS_PER_TILE);
+                tiles++;
+            }
+            pos += c;
+        }
+        scratch[0] = tiles;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    for (uint p2 = tid; p2 < n_pairs; p2 += uint(WG_SIZE)) {
+        uint e = ids[offset_ids + (p2 / n_used) * ids_s1 + p2 % n_used];
+        if (e < n_experts) {
+            uint slot = atomicAdd(starts[e], 1u);
+            scratch[list_base + slot] = p2;
+        }
+    }
+}

@@ -1,0 +1,72 @@
+#include "common.glsl"
+
+// LIGHTNING_INDEXER (DSA): dst[ik, t, s] = sum_h max(q[:, h, t, s] . k[:, 0, ik, s], 0) * w[h, t, s]
+//                                          + mask[ik, t, s % mask_ne3]
+// One thread per output. q, w, dst f32; mask f16; K f32, or f16 with K_F16. Offsets and strides in elements.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Q    { uint q_buf[]; };
+layout(std430, binding = 1) buffer K    { uint k_buf[]; };
+layout(std430, binding = 2) buffer W    { uint w_buf[]; };
+layout(std430, binding = 3) buffer Mask { uint mask[]; };
+layout(std430, binding = 4) buffer Dst  { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_q;
+    uint offset_k;
+    uint offset_w;
+    uint offset_m;
+    uint offset_dst;
+
+    uint stride_q1;
+    uint stride_q2;
+    uint stride_q3;
+    uint stride_k2;
+    uint stride_k3;
+    uint stride_w1;
+    uint stride_w3;
+    uint stride_m1;
+    uint stride_m3;
+    uint stride_d1;
+    uint stride_d3;
+
+    uint n_embd;
+    uint n_head;
+    uint n_kv;
+    uint n_tokens;
+    uint mask_ne3;
+    uint n_out;
+
+    uint nwg_x;
+};
+
+#if defined(K_F16)
+#define LOAD_K(i) LOAD_F16(k_buf, i)
+#else
+#define LOAD_K(i) LOAD_F32(k_buf, i)
+#endif
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= n_out) {
+        return;
+    }
+    uint ik = i % n_kv;
+    uint t  = (i / n_kv) % n_tokens;
+    uint s  = i / (n_kv * n_tokens);
+
+    uint k_base = offset_k + ik * stride_k2 + s * stride_k3;
+    uint w_base = offset_w + t * stride_w1 + s * stride_w3;
+    float score = 0.0;
+    for (uint h = 0u; h < n_head; h++) {
+        uint  q_base = offset_q + h * stride_q1 + t * stride_q2 + s * stride_q3;
+        float qk     = 0.0;
+        for (uint e = 0u; e < n_embd; e++) {
+            qk += LOAD_F32(q_buf, q_base + e) * LOAD_K(k_base + e);
+        }
+        score += max(qk, 0.0) * LOAD_F32(w_buf, w_base + h);
+    }
+    uint m_i = offset_m + t * stride_m1 + (s % mask_ne3) * stride_m3 + ik;
+    STORE_F32(dst, offset_dst + t * stride_d1 + s * stride_d3 + ik, score + LOAD_F16(mask, m_i));
+}

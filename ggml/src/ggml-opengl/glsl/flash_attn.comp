@@ -9,7 +9,7 @@
 // Output row = i3 * n_q * n_head + i1 * n_head + i2; a dispatch covers rows row0 .. row0 + n_rows - 1 and t is
 // the row index inside that range.
 // defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32 or K_Q8_0, V_F16, V_F32 or V_Q8_0,
-//          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE
+//          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE, MQ4 (pass 1 with 4 query rows per workgroup)
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -158,12 +158,190 @@ void main() {
         dst[dst_base + d] = floatBitsToUint(acc * inv);
     }
 }
+#elif defined(MQ4)
+// pass 1 for prompts: one workgroup per (4 query rows of one head, block of WG_SIZE KV entries), so each K and V
+// entry is loaded once for 4 queries. Group g of a dispatch holds rows t, t + n_head, t + 2 n_head, t + 3 n_head
+// with t = (g / n_head) * 4 n_head + g % n_head: the same head and batch, 4 consecutive query positions. The host
+// uses it only when n_q is a multiple of 4 and row0 / n_rows are multiples of 4 n_head; DK and DV at most 256.
+// Component q of every vec4 below belongs to query q. Same tmp layout as the one-row pass.
+shared float q_sh[4][DK];
+shared vec4  p_sh[WG_SIZE];
+shared vec4  red_sh[WG_SIZE];
+shared vec4  acc_sh[WG_SIZE];
+
+void main() {
+    uint wg  = gl_WorkGroupID.x + nwg_x * gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (wg >= (n_rows / 4u) * n_blocks) {
+        return;
+    }
+    uint g   = wg / n_blocks;
+    uint b   = wg % n_blocks;
+    uint t0  = (g / n_head) * 4u * n_head + g % n_head;
+    uint row = row0 + t0;
+    uint i3  = row / (n_q * n_head);
+    uint i1  = (row % (n_q * n_head)) / n_head;   // first of the 4 query positions
+    uint i2  = row % n_head;
+
+    for (uint a = tid; a < 4u * uint(DK); a += uint(WG_SIZE)) {
+        uint qq = a / uint(DK);
+        uint e  = a % uint(DK);
+        q_sh[qq][e] = uintBitsToFloat(q_buf[offset_q + i3 * stride_q3 + i2 * stride_q2 + (i1 + qq) * stride_q1 + e]);
+    }
+    memoryBarrierShared();
+    barrier();
+
+    uint k_base = offset_k + (i3 / rk3) * stride_k3 + (i2 / rk2) * stride_k2;
+    uint v_base = offset_v + (i3 / rv3) * stride_v3 + (i2 / rv2) * stride_v2;
+
+    // scores of entry j for the 4 queries; NEG_INF_SCORE when past the end or masked
+    uint j = b * blk_size + tid;
+    vec4 s = vec4(NEG_INF_SCORE);
+    if (j < n_kv) {
+        bvec4 visible = bvec4(true);
+        vec4  mv      = vec4(0.0);
+#if defined(HAS_MASK)
+        float slope = 1.0;
+        if (max_bias > 0.0) {
+            float h = float(i2);
+            slope = h < n_head_log2 ? pow(m0, h + 1.0) : pow(m1, 2.0 * (h - n_head_log2) + 1.0);
+        }
+        for (uint qq = 0u; qq < 4u; qq++) {
+            uint m_base = offset_mask + (i3 % mask_ne3) * stride_m3 + (i2 % mask_ne2) * stride_m2 + (i1 + qq) * stride_m1;
+            uint mbits  = (mask[(m_base + j) >> 1] >> (((m_base + j) & 1u) * 16u)) & 0xFFFFu;
+            visible[qq] = mbits != 0xFC00u;
+            mv[qq]      = slope * f16_to_f32(mbits);
+        }
+#endif
+        if (any(visible)) {
+#if defined(K_Q8_0)
+            uint kj = (k_base + j * stride_k1) * 32u;
+#else
+            uint kj = k_base + j * stride_k1;
+#endif
+            vec4 d = vec4(0.0);
+            for (uint a = 0u; a < uint(DK / 4); a++) {
+                vec4 kk = load_k4(kj + 4u * a);
+                uint e  = 4u * a;
+                d.x += dot(vec4(q_sh[0][e], q_sh[0][e + 1u], q_sh[0][e + 2u], q_sh[0][e + 3u]), kk);
+                d.y += dot(vec4(q_sh[1][e], q_sh[1][e + 1u], q_sh[1][e + 2u], q_sh[1][e + 3u]), kk);
+                d.z += dot(vec4(q_sh[2][e], q_sh[2][e + 1u], q_sh[2][e + 2u], q_sh[2][e + 3u]), kk);
+                d.w += dot(vec4(q_sh[3][e], q_sh[3][e + 1u], q_sh[3][e + 2u], q_sh[3][e + 3u]), kk);
+            }
+            d *= scale;
+#if defined(SOFTCAP)
+            d = logit_softcap * tanh(clamp(d, vec4(-9.010913), vec4(9.010913)));
+#endif
+            for (uint qq = 0u; qq < 4u; qq++) {
+                if (visible[qq]) {
+                    s[qq] = d[qq] + mv[qq];
+                }
+            }
+        }
+    }
+
+    // block maximum per query
+    red_sh[tid] = s;
+    memoryBarrierShared();
+    barrier();
+    for (uint h = uint(WG_SIZE) / 2u; h > 0u; h /= 2u) {
+        if (tid < h) {
+            red_sh[tid] = max(red_sh[tid], red_sh[tid + h]);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    vec4 M = red_sh[0];
+    memoryBarrierShared();
+    barrier();
+
+    vec4 p;
+    for (uint qq = 0u; qq < 4u; qq++) {
+        p[qq] = s[qq] <= NEG_INF_SCORE ? 0.0 : exp(s[qq] - M[qq]);
+    }
+    p_sh[tid]   = p;
+    red_sh[tid] = p;
+    memoryBarrierShared();
+    barrier();
+    for (uint h2 = uint(WG_SIZE) / 2u; h2 > 0u; h2 /= 2u) {
+        if (tid < h2) {
+            red_sh[tid] += red_sh[tid + h2];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    vec4 S = red_sh[0];
+
+    // tmp row of query q: t0 + q * n_head
+    if (tid == 0u) {
+        for (uint qq = 0u; qq < 4u; qq++) {
+            uint base_q = ((t0 + qq * n_head) * n_blocks + b) * uint(DV + 1);
+            tmp[base_q] = floatBitsToUint(S[qq] == 0.0 ? NEG_INF_SCORE : M[qq] + log(S[qq]));
+        }
+    }
+    if (all(equal(S, vec4(0.0)))) {
+        return;   // uniform: S is the same for the whole workgroup
+    }
+    vec4 inv = vec4(S.x == 0.0 ? 0.0 : 1.0 / S.x, S.y == 0.0 ? 0.0 : 1.0 / S.y,
+                    S.z == 0.0 ? 0.0 : 1.0 / S.z, S.w == 0.0 ? 0.0 : 1.0 / S.w);
+    uint jn = min(blk_size, n_kv - b * blk_size);
+
+    // G groups of DV/4 threads: thread (gr, d4) sums entries gr, gr + G, ... for its 4 output elements and all
+    // 4 queries; the group sums are then added in shared memory, one query at a time
+    const uint D4 = uint(DV / 4);
+    const uint G  = uint(WG_SIZE) / D4;
+    uint d4 = tid % D4;
+    uint gr = tid / D4;
+    vec4 acc0 = vec4(0.0);
+    vec4 acc1 = vec4(0.0);
+    vec4 acc2 = vec4(0.0);
+    vec4 acc3 = vec4(0.0);
+    if (gr < G) {
+        for (uint jj = gr; jj < jn; jj += G) {
+            vec4 pj = p_sh[jj];
+            if (any(notEqual(pj, vec4(0.0)))) {
+#if defined(V_Q8_0)
+                uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                vec4 vv = load_v4(vj + 4u * d4);
+                acc0 += pj.x * vv;
+                acc1 += pj.y * vv;
+                acc2 += pj.z * vv;
+                acc3 += pj.w * vv;
+            }
+        }
+    }
+    for (uint qq = 0u; qq < 4u; qq++) {
+        acc_sh[tid] = qq == 0u ? acc0 : (qq == 1u ? acc1 : (qq == 2u ? acc2 : acc3));
+        memoryBarrierShared();
+        barrier();
+        if (tid < D4) {
+            vec4 sum = vec4(0.0);
+            for (uint gg = 0u; gg < G; gg++) {
+                sum += acc_sh[gg * D4 + tid];
+            }
+            sum *= inv[qq];
+            uint base_q = ((t0 + qq * n_head) * n_blocks + b) * uint(DV + 1);
+            tmp[base_q + 1u + 4u * tid] = floatBitsToUint(sum.x);
+            tmp[base_q + 2u + 4u * tid] = floatBitsToUint(sum.y);
+            tmp[base_q + 3u + 4u * tid] = floatBitsToUint(sum.z);
+            tmp[base_q + 4u + 4u * tid] = floatBitsToUint(sum.w);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+}
 #else
 // pass 1: one workgroup per (output row, block of WG_SIZE KV entries), for any query length. Thread
 // j scores KV entry j, then thread d sums the softmax-weighted values of output element d. Same tmp layout.
 shared float q_sh[DK];
 shared float p_sh[WG_SIZE];
 shared float red_sh[WG_SIZE];
+#if (DV / 4) * 2 <= WG_SIZE
+shared vec4 acc_sh[WG_SIZE];
+#endif
 
 void main() {
     uint wg  = gl_WorkGroupID.x + nwg_x * gl_WorkGroupID.y;
@@ -264,6 +442,42 @@ void main() {
     }
     float inv = 1.0 / S;
     uint  jn  = min(blk_size, n_kv - b * blk_size);
+#if (DV / 4) * 2 <= WG_SIZE
+    // G groups of DV/4 threads: thread (g, d4) sums entries g, g + G, ... for its 4 output elements, then the
+    // group sums are added in shared memory (one group of DV/4 threads left most of the workgroup idle)
+    const uint D4 = uint(DV / 4);
+    const uint G  = uint(WG_SIZE) / D4;
+    uint d4g = tid % D4;
+    uint g   = tid / D4;
+    vec4 accg = vec4(0.0);
+    if (g < G) {
+        for (uint jj = g; jj < jn; jj += G) {
+            float pj = p_sh[jj];
+            if (pj != 0.0) {
+#if defined(V_Q8_0)
+                uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
+#else
+                uint vj = v_base + (b * blk_size + jj) * stride_v1;
+#endif
+                accg += pj * load_v4(vj + 4u * d4g);
+            }
+        }
+    }
+    acc_sh[tid] = accg;
+    memoryBarrierShared();
+    barrier();
+    if (tid < D4) {
+        vec4 sum = vec4(0.0);
+        for (uint gg = 0u; gg < G; gg++) {
+            sum += acc_sh[gg * D4 + tid];
+        }
+        sum *= inv;
+        tmp[base + 1u + 4u * tid] = floatBitsToUint(sum.x);
+        tmp[base + 2u + 4u * tid] = floatBitsToUint(sum.y);
+        tmp[base + 3u + 4u * tid] = floatBitsToUint(sum.z);
+        tmp[base + 4u + 4u * tid] = floatBitsToUint(sum.w);
+    }
+#else
     // thread tid owns 4 consecutive output elements per step
     for (uint d4 = tid; d4 < uint(DV / 4); d4 += uint(WG_SIZE)) {
         vec4 acc = vec4(0.0);
@@ -284,5 +498,6 @@ void main() {
         tmp[base + 3u + 4u * d4] = floatBitsToUint(acc.z);
         tmp[base + 4u + 4u * d4] = floatBitsToUint(acc.w);
     }
+#endif
 }
 #endif

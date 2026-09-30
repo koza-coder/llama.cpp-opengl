@@ -1,7 +1,7 @@
 #include "common.glsl"
 
-// Port of the D3D11 set_rows.hlsl: dst[idx[row]] = src[row]; src is f32.
-// defines: DST_{F32,F16}, I64_IDX (the low 32 bits of each index are used)
+// Port of the D3D11 set_rows.hlsl: dst[idx[row]] = src[row]; src is f32, or f16 with SRC_F16.
+// defines: DST_{F32,F16}, SRC_F16, I64_IDX (the low 32 bits of each index are used)
 
 #if defined(DST_F16)
 #define STORE_DST(i, v) STORE_F16(dst, i, v)
@@ -66,5 +66,9 @@ void main() {
     uint i_dst_row = offset_dst + idx_val * stride_dst1 + i_src2 * stride_dst2 + i_src3 * stride_dst3;
     uint i_src_row = offset_src + i_src1 * stride_src1 + i_src2 * stride_src2 + i_src3 * stride_src3;
 
+#if defined(SRC_F16)
+    STORE_DST(i_dst_row + col, LOAD_F16(src, i_src_row + col));
+#else
     STORE_DST(i_dst_row + col, LOAD_F32(src, i_src_row + col));
+#endif
 }

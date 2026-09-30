@@ -1,6 +1,8 @@
 #include "common.glsl"
 
 // Port of the D3D11 concat.hlsl. CONCAT of two 4-byte tensors (f32 or i32, copied as raw bits) along dim; any strides
+// ELEM16: 2-byte elements (f16) instead; strides and offsets are then in halves, the dst half is written with two
+// atomics so the other half of its word is kept
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -51,6 +53,20 @@ void main() {
     idx[0] = i % ne0;
 
     const uint i_dst = offset_dst + idx[0] * stride_dst0 + idx[1] * stride_dst1 + idx[2] * stride_dst2 + idx[3] * stride_dst3;
+#if defined(ELEM16)
+    uint bits;
+    if (idx[dim] < src0_nedim) {
+        uint j = offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03;
+        bits = (src0[j >> 1] >> ((j & 1u) * 16u)) & 0xFFFFu;
+    } else {
+        idx[dim] -= src0_nedim;
+        uint j = offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13;
+        bits = (src1[j >> 1] >> ((j & 1u) * 16u)) & 0xFFFFu;
+    }
+    uint sh = (i_dst & 1u) * 16u;
+    atomicAnd(dst[i_dst >> 1], ~(0xFFFFu << sh));
+    atomicOr(dst[i_dst >> 1], bits << sh);
+#else
     uint bits;
     if (idx[dim] < src0_nedim) {
         bits = src0[offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03];
@@ -59,4 +75,5 @@ void main() {
         bits = src1[offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13];
     }
     dst[i_dst] = bits;
+#endif
 }

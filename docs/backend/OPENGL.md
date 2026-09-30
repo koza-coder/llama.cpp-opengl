@@ -9,13 +9,13 @@ driver offers an OpenGL 4.3 (or newer) core context, including GPUs without Vulk
 
 ## Status
 
-Tested with release v0.0.2:
+Tested with release v0.0.3:
 
 | GPU | Result |
 |---|---|
-| AMD Radeon AI PRO R9700 | all 44 op groups pass (5853 tests); Qwen2.5-0.5B, LFM2.5-1.2B, Ministral-3-3B, Qwen3.5-9B correct; LFM2.5-1.2B pp512 2785 / tg64 78 tok/s, Qwen3.5-9B pp512 485 / tg64 20.5 tok/s |
-| Intel Iris Xe | flash attention and the small ops pass (MUL_MAT not run, too slow on that machine); qwen2.5-0.5b q4_0 pp512 255 / tg64 6.4 tok/s |
-| Moore Threads MTT S80 | flash attention and quantized MUL_MAT pass; 37 f32 MUL_MAT broadcast cases fail; the tiled prompt kernel is off on this GPU (its compiler rejects it); qwen2.5-0.5b q4_0 pp512 111 / tg64 21 tok/s |
+| AMD Radeon AI PRO R9700 | new op groups pass (flash attention 3260, MUL_MAT_ID 768, GET_ROWS, IM2COL, FILL, ROPE_BACK, SWIGLU_CLAMP); qwen2.5-0.5b q4_0 PPL 17.29, pp512 5948 / tg64 86 tok/s; SmolVLM-500M (image) and Qwen3-ASR (speech) correct |
+| Intel Iris Xe | new op groups pass (MUL_MAT not run, too slow on that machine); qwen2.5-0.5b q4_0 PPL 17.29, pp512 323 / tg64 6.5 tok/s; SmolVLM-500M and Qwen3-ASR correct |
+| Moore Threads MTT S80 | not tested with v0.0.3 (offline). v0.0.2: flash attention and quantized MUL_MAT pass; 37 f32 MUL_MAT broadcast cases fail; the tiled prompt kernel is off on this GPU |
 
 Ops the backend does not support run on the CPU (the ggml scheduler does this automatically). The authoritative list
 of supported ops and types is `ggml_backend_opengl_device_supports_op` in `ggml-opengl.cpp`.
