@@ -18,6 +18,7 @@
 
 #include "ggml-opengl-shaders.hpp"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -26,6 +27,28 @@
 #endif
 #include <windows.h>
 #include <GL/gl.h>
+#else
+// Linux: EGL without a window; no GL or EGL headers needed, libEGL is opened at run time
+#include <dlfcn.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <chrono>
+#include <cstdint>
+#include <cstddef>
+typedef unsigned int  GLenum;
+typedef unsigned int  GLuint;
+typedef int           GLint;
+typedef int           GLsizei;
+typedef unsigned char GLubyte;
+typedef unsigned int  GLbitfield;
+#define APIENTRY
+#define GL_NO_ERROR      0
+#define GL_TRUE          1
+#define GL_UNSIGNED_BYTE 0x1401
+#define GL_RENDERER      0x1F01
+#define GL_VERSION       0x1F02
+#define GL_EXTENSIONS    0x1F03
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +66,9 @@
 // Below 16 columns the matvec kernel is as fast or faster (measured for the D3D11 kernels, not for GL)
 #define GGML_GL_TILED_DEFAULT        16
 #define GGML_GL_WG_SIZE              256
+#ifndef GGML_GL_MAX_TPR
+#define GGML_GL_MAX_TPR              GGML_GL_WG_SIZE   // matrix-vector threads per row cap (power of two)
+#endif
 #define GGML_GL_MAX_WG_PER_DIM       65535
 #define GGML_GL_BINDING_ALIGNMENT    256   // minimum tensor binding alignment; raised to the driver's SSBO offset alignment
 #define GGML_GL_PARAM_SLOT_SIZE      256
@@ -85,6 +111,15 @@ enum : GLenum {
     E_VBO_FREE_MEMORY_ATI                  = 0x87FB,
     E_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX = 0x9047,
     E_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX = 0x9049,
+    E_TIME_ELAPSED                         = 0x88BF,
+    E_QUERY_RESULT                         = 0x8866,
+    E_MAP_WRITE_BIT                        = 0x0002,
+    E_MAP_PERSISTENT_BIT                   = 0x0040,
+    E_MAP_COHERENT_BIT                     = 0x0080,
+    E_SYNC_GPU_COMMANDS_COMPLETE           = 0x9117,
+    E_SYNC_FLUSH_COMMANDS_BIT              = 0x0001,
+    E_TIMEOUT_EXPIRED                      = 0x911B,
+    E_WAIT_FAILED                          = 0x911D,
 };
 enum : int {
     E_WGL_CONTEXT_MAJOR_VERSION = 0x2091,
@@ -95,6 +130,7 @@ enum : int {
     E_WGL_CONTEXT_CORE_BIT      = 0x0001,
 };
 
+typedef struct gl_sync_s * gl_sync_t;   // GLsync
 typedef void (APIENTRY * gl_debug_cb_t)(GLenum, GLenum, GLuint, GLenum, GLsizei, const char *, const void *);
 
 // required functions past GL 1.1; the device is skipped when one is missing
@@ -134,7 +170,16 @@ typedef void (APIENTRY * gl_debug_cb_t)(GLenum, GLenum, GLuint, GLenum, GLsizei,
     X(void, glProgramBinary, (GLuint, GLenum, const void *, GLsizei)) \
     X(void, glProgramParameteri, (GLuint, GLenum, GLint)) \
     X(void, glMaxShaderCompilerThreadsARB, (GLuint)) \
-    X(void, glMaxShaderCompilerThreadsKHR, (GLuint))
+    X(void, glMaxShaderCompilerThreadsKHR, (GLuint)) \
+    X(void, glGenQueries, (GLsizei, GLuint *)) \
+    X(void, glBeginQuery, (GLenum, GLuint)) \
+    X(void, glEndQuery, (GLenum)) \
+    X(void, glGetQueryObjectui64v, (GLuint, GLenum, unsigned long long *)) \
+    X(void, glBufferStorage, (GLenum, ptrdiff_t, const void *, GLbitfield)) \
+    X(void *, glMapBufferRange, (GLenum, ptrdiff_t, ptrdiff_t, GLbitfield)) \
+    X(gl_sync_t, glFenceSync, (GLenum, GLbitfield)) \
+    X(GLenum, glClientWaitSync, (gl_sync_t, GLbitfield, unsigned long long)) \
+    X(void, glDeleteSync, (gl_sync_t))
 
 // one device only (WGL has no adapter choice), so one global table
 #define GGML_GL_DECL(ret, name, args) static ret (APIENTRY * p_##name) args = nullptr;
@@ -142,6 +187,7 @@ GGML_GL_FUNCS(GGML_GL_DECL)
 GGML_GL_FUNCS_OPT(GGML_GL_DECL)
 #undef GGML_GL_DECL
 
+#ifdef _WIN32
 static HMODULE g_opengl32 = nullptr;
 
 static PROC ggml_opengl_get_proc(const char * name) {
@@ -152,6 +198,70 @@ static PROC ggml_opengl_get_proc(const char * name) {
     }
     return p;
 }
+#else
+// GL 1.1 entry points too come from eglGetProcAddress (EGL 1.5 / EGL_KHR_get_all_proc_addresses)
+#define GGML_GL_FUNCS_11(X) \
+    X(GLenum, glGetError, (void)) \
+    X(const GLubyte *, glGetString, (GLenum)) \
+    X(void, glGetIntegerv, (GLenum, GLint *)) \
+    X(void, glEnable, (GLenum)) \
+    X(void, glFinish, (void)) \
+    X(void, glFlush, (void))
+
+#define GGML_GL_DECL(ret, name, args) static ret (APIENTRY * p_##name) args = nullptr;
+GGML_GL_FUNCS_11(GGML_GL_DECL)
+#undef GGML_GL_DECL
+#define glGetError    p_glGetError
+#define glGetString   p_glGetString
+#define glGetIntegerv p_glGetIntegerv
+#define glEnable      p_glEnable
+#define glFinish      p_glFinish
+#define glFlush       p_glFlush
+
+typedef void * EGLDisplay;
+typedef void * EGLContext;
+typedef void * EGLConfig;
+typedef void * EGLSurface;
+typedef int    EGLint;
+typedef unsigned int EGLBoolean;
+typedef unsigned int EGLenum;
+enum : EGLint {
+    E_EGL_NONE                     = 0x3038,
+    E_EGL_EXTENSIONS               = 0x3055,
+    E_EGL_OPENGL_API               = 0x30A2,
+    E_EGL_CONTEXT_MAJOR_VERSION    = 0x3098,
+    E_EGL_CONTEXT_MINOR_VERSION    = 0x30FB,
+    E_EGL_CONTEXT_OPENGL_PROFILE_MASK = 0x30FD,
+    E_EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT = 0x0001,
+    E_EGL_CONTEXT_OPENGL_DEBUG     = 0x31B0,
+    E_EGL_PLATFORM_SURFACELESS_MESA = 0x31DD,
+};
+
+// EGL entry points, from libEGL.so.1
+#define GGML_EGL_FUNCS(X) \
+    X(void *, eglGetProcAddress, (const char *)) \
+    X(EGLDisplay, eglGetPlatformDisplay, (EGLenum, void *, const intptr_t *)) \
+    X(EGLBoolean, eglInitialize, (EGLDisplay, EGLint *, EGLint *)) \
+    X(EGLBoolean, eglTerminate, (EGLDisplay)) \
+    X(const char *, eglQueryString, (EGLDisplay, EGLint)) \
+    X(EGLBoolean, eglBindAPI, (EGLenum)) \
+    X(EGLContext, eglCreateContext, (EGLDisplay, EGLConfig, EGLContext, const EGLint *)) \
+    X(EGLBoolean, eglDestroyContext, (EGLDisplay, EGLContext)) \
+    X(EGLBoolean, eglMakeCurrent, (EGLDisplay, EGLSurface, EGLSurface, EGLContext)) \
+    X(EGLContext, eglGetCurrentContext, (void)) \
+    X(EGLDisplay, eglGetCurrentDisplay, (void)) \
+    X(EGLint, eglGetError, (void))
+
+#define GGML_GL_DECL(ret, name, args) static ret (* p_##name) args = nullptr;
+GGML_EGL_FUNCS(GGML_GL_DECL)
+#undef GGML_GL_DECL
+
+static void * g_libegl = nullptr;
+
+static void * ggml_opengl_get_proc(const char * name) {
+    return p_eglGetProcAddress ? p_eglGetProcAddress(name) : nullptr;
+}
+#endif
 
 // returns the number of missing required functions
 static int ggml_opengl_load_funcs() {
@@ -159,6 +269,9 @@ static int ggml_opengl_load_funcs() {
 #define GGML_GL_LOAD(ret, name, args) \
     p_##name = (ret (APIENTRY *) args) (void *) ggml_opengl_get_proc(#name); \
     if (!p_##name) { GGML_LOG_WARN("ggml_opengl: missing %s\n", #name); missing++; }
+#ifndef _WIN32
+    GGML_GL_FUNCS_11(GGML_GL_LOAD)
+#endif
     GGML_GL_FUNCS(GGML_GL_LOAD)
 #undef GGML_GL_LOAD
 #define GGML_GL_LOAD_OPT(ret, name, args) p_##name = (ret (APIENTRY *) args) (void *) ggml_opengl_get_proc(#name);
@@ -168,6 +281,7 @@ static int ggml_opengl_load_funcs() {
 }
 
 static double ggml_opengl_time_us() {
+#ifdef _WIN32
     static LARGE_INTEGER freq = {};
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);
@@ -175,6 +289,9 @@ static double ggml_opengl_time_us() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return (double) now.QuadPart * 1e6 / (double) freq.QuadPart;
+#else
+    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 
 // GGML_OPENGL_<name>, else GGML_D3D12_<name>: the box test runner passes only GGML_D3D12_* variables
@@ -203,9 +320,14 @@ struct gl_device_ctx {
     std::string name;      // "OpenGL0"
     std::string desc;      // GL_RENDERER
     std::string version;   // GL_VERSION
+#ifdef _WIN32
     HWND        hwnd = nullptr;
     HDC         dc   = nullptr;
     HGLRC       ctx  = nullptr;
+#else
+    EGLDisplay  dpy  = nullptr;
+    EGLContext  ctx  = nullptr;
+#endif
 
     size_t   max_alloc    = 0;
     size_t   bind_align   = GGML_GL_BINDING_ALIGNMENT;
@@ -216,8 +338,23 @@ struct gl_device_ctx {
     bool     ati_meminfo  = false;
     bool     nvx_meminfo  = false;
     uint32_t tiled_min_cols = GGML_GL_TILED_DEFAULT;
+    uint32_t max_tpr        = GGML_GL_MAX_TPR;
+    bool     no_fuse        = false;   // GGML_OPENGL_NO_FUSE: every node on its own
 
     GLuint   ubo       = 0;   // kernel parameters, one slot per dispatch, reused round robin
+    // GL 4.4 buffer storage: the parameter buffer stays mapped (persistent, coherent) and is written with memcpy;
+    // one fence per quarter of the ring keeps a slot from being rewritten while the GPU may still read it
+    uint8_t *              ubo_map = nullptr;
+    gl_sync_t              ubo_fence[4] = {};
+    // last program and SSBO bindings set by a dispatch, so repeats are skipped; forgotten at graph start and
+    // whenever a buffer is deleted (a new buffer can get the deleted one's name)
+    struct bind_state {
+        GLuint buf    = 0;
+        size_t offset = 0;
+        size_t size   = 0;
+    };
+    GLuint                  cur_prog = 0;
+    std::vector<bind_state> cur_bind;
 
     GLuint   fa_tmp      = 0;   // flash attention block results, grown on demand
     size_t   fa_tmp_size = 0;
@@ -256,6 +393,17 @@ struct gl_device_ctx {
     double   t_set_us       = 0;
     double   t_get_us       = 0;
 
+    // GGML_OPENGL_PROFILE: GPU time per pipeline from GL_TIME_ELAPSED queries around every dispatch; the
+    // queries of one graph are read at the start of the next one (by then they are done in generation)
+    struct prof_entry {
+        uint64_t ns = 0;
+        uint64_t n  = 0;
+    };
+    bool                                          profile = false;
+    std::vector<GLuint>                           q_free;
+    std::vector<std::pair<GLuint, std::string>>   q_pending;
+    std::unordered_map<std::string, prof_entry>   prof;
+
     std::recursive_mutex mutex;
 
     ggml_backend_buffer_type buft = {};
@@ -276,6 +424,7 @@ static std::shared_ptr<gl_device_ctx> ggml_opengl_shared_dev(gl_device_ctx * dev
 
 // Takes the device lock and makes the device's context current on this thread; restores the previous
 // context (or none) on exit. Nests: an inner scope finds the context already current.
+#ifdef _WIN32
 struct gl_scope {
     gl_device_ctx &                        dev;
     std::lock_guard<std::recursive_mutex> lock;
@@ -298,6 +447,37 @@ struct gl_scope {
     }
 };
 
+static void ggml_opengl_release_current(gl_device_ctx &) {
+    wglMakeCurrent(nullptr, nullptr);
+}
+#else
+struct gl_scope {
+    gl_device_ctx &                        dev;
+    std::lock_guard<std::recursive_mutex> lock;
+    EGLContext                             prev_ctx;
+    EGLDisplay                             prev_dpy;
+    bool                                   switched;
+
+    explicit gl_scope(gl_device_ctx & d) : dev(d), lock(d.mutex) {
+        prev_ctx = p_eglGetCurrentContext();
+        prev_dpy = p_eglGetCurrentDisplay();
+        switched = prev_ctx != dev.ctx;
+        if (switched && !p_eglMakeCurrent(dev.dpy, nullptr, nullptr, dev.ctx)) {
+            GGML_ABORT("ggml_opengl: eglMakeCurrent failed (error 0x%x)", (unsigned) p_eglGetError());
+        }
+    }
+    ~gl_scope() {
+        if (switched) {
+            p_eglMakeCurrent(prev_ctx ? prev_dpy : dev.dpy, nullptr, nullptr, prev_ctx);
+        }
+    }
+};
+
+static void ggml_opengl_release_current(gl_device_ctx & dev) {
+    p_eglMakeCurrent(dev.dpy, nullptr, nullptr, nullptr);
+}
+#endif
+
 static void ggml_opengl_check_error(const char * what) {
     for (int i = 0; i < 8; i++) {
         const GLenum e = glGetError();
@@ -310,6 +490,33 @@ static void ggml_opengl_check_error(const char * what) {
 
 /* Shader compilation and the program binary cache */
 
+#ifndef _WIN32
+// the cache code uses the Win32 wide-path calls; on Linux the paths are plain bytes
+static std::string ggml_opengl_narrow(const wchar_t * s) {
+    std::string r;
+    for (; *s; s++) {
+        r += (char) *s;
+    }
+    return r;
+}
+static FILE * _wfopen(const wchar_t * path, const wchar_t * mode) {
+    return fopen(ggml_opengl_narrow(path).c_str(), ggml_opengl_narrow(mode).c_str());
+}
+static bool CreateDirectoryW(const wchar_t * path, void *) {
+    return mkdir(ggml_opengl_narrow(path).c_str(), 0755) == 0;
+}
+static bool DeleteFileW(const wchar_t * path) {
+    return unlink(ggml_opengl_narrow(path).c_str()) == 0;
+}
+#define MOVEFILE_REPLACE_EXISTING 0
+static bool MoveFileExW(const wchar_t * from, const wchar_t * to, int) {
+    return rename(ggml_opengl_narrow(from).c_str(), ggml_opengl_narrow(to).c_str()) == 0;
+}
+static unsigned GetCurrentProcessId() {
+    return (unsigned) getpid();
+}
+#endif
+
 // program binaries are cached in opengl-shader-cache next to ggml-opengl.dll; GGML_OPENGL_NO_SHADER_CACHE
 // disables it. Unwritable folders just skip the cache.
 static const std::wstring & ggml_opengl_shader_cache_dir() {
@@ -317,6 +524,7 @@ static const std::wstring & ggml_opengl_shader_cache_dir() {
         if (getenv("GGML_OPENGL_NO_SHADER_CACHE") != nullptr) {
             return L"";
         }
+#ifdef _WIN32
         HMODULE module = nullptr;
         wchar_t path[MAX_PATH];
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -325,6 +533,14 @@ static const std::wstring & ggml_opengl_shader_cache_dir() {
             return L"";
         }
         std::wstring d = path;
+#else
+        Dl_info info = {};
+        if (!dladdr((void *) &ggml_opengl_shader_cache_dir, &info) || !info.dli_fname) {
+            return L"";
+        }
+        std::string  p = info.dli_fname;
+        std::wstring d(p.begin(), p.end());
+#endif
         d = d.substr(0, d.find_last_of(L"\\/") + 1) + L"opengl-shader-cache";
         CreateDirectoryW(d.c_str(), nullptr);
         return d;
@@ -350,7 +566,7 @@ static std::wstring ggml_opengl_shader_cache_file(const gl_device_ctx & dev, con
     hash_bytes(text.c_str(), text.size() + 1);
     hash_bytes(dev.desc.c_str(), dev.desc.size() + 1);
     hash_bytes(dev.version.c_str(), dev.version.size() + 1);
-    std::wstring name = L"\\0000000000000000.glbin";
+    std::wstring name = L"/0000000000000000.glbin";
     for (int i = 16; i > 0; i--, h >>= 4) {
         name[i] = L"0123456789abcdef"[h & 0xf];
     }
@@ -461,7 +677,7 @@ static std::string ggml_opengl_shader_text(const char * source, const std::vecto
 // programs at device init, all at once, so the driver compiles them in parallel
 static std::wstring ggml_opengl_shader_list_file() {
     const std::wstring & dir = ggml_opengl_shader_cache_dir();
-    return dir.empty() ? L"" : dir + L"\\shaders.txt";
+    return dir.empty() ? L"" : dir + L"/shaders.txt";
 }
 
 static std::mutex                  g_listed_mutex;
@@ -672,18 +888,65 @@ static void ggml_opengl_dispatch(gl_device_ctx & dev, gl_pipeline & pipeline, st
     GGML_ASSERT(params.size() * sizeof(uint32_t) <= GGML_GL_PARAM_SLOT_SIZE);
 
     const size_t slot_off = (size_t) dev.next_slot * dev.param_slot;
-    dev.next_slot         = (dev.next_slot + 1) % GGML_GL_PARAM_SLOT_COUNT;
-    p_glBindBuffer(E_UNIFORM_BUFFER, dev.ubo);
-    p_glBufferSubData(E_UNIFORM_BUFFER, (ptrdiff_t) slot_off, (ptrdiff_t) (params.size() * sizeof(uint32_t)), params.data());
+    if (dev.ubo_map) {
+        constexpr uint32_t quarter = GGML_GL_PARAM_SLOT_COUNT / 4;
+        if (dev.next_slot % quarter == 0) {
+            // entering quarter q: fence the work so far (it covers the previous quarter's slots), then wait for
+            // the fence set when quarter q was last left
+            const uint32_t q    = dev.next_slot / quarter;
+            gl_sync_t &    prev = dev.ubo_fence[(q + 3) % 4];
+            if (prev) {
+                p_glDeleteSync(prev);
+            }
+            prev = p_glFenceSync(E_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            if (dev.ubo_fence[q]) {
+                GLenum r;
+                while ((r = p_glClientWaitSync(dev.ubo_fence[q], E_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull)) == E_TIMEOUT_EXPIRED) {
+                }
+                GGML_ASSERT(r != E_WAIT_FAILED);
+                p_glDeleteSync(dev.ubo_fence[q]);
+                dev.ubo_fence[q] = nullptr;
+            }
+        }
+        memcpy(dev.ubo_map + slot_off, params.data(), params.size() * sizeof(uint32_t));
+    } else {
+        p_glBindBuffer(E_UNIFORM_BUFFER, dev.ubo);
+        p_glBufferSubData(E_UNIFORM_BUFFER, (ptrdiff_t) slot_off, (ptrdiff_t) (params.size() * sizeof(uint32_t)), params.data());
+    }
+    dev.next_slot = (dev.next_slot + 1) % GGML_GL_PARAM_SLOT_COUNT;
     p_glBindBufferRange(E_UNIFORM_BUFFER, 0, dev.ubo, (ptrdiff_t) slot_off, GGML_GL_PARAM_SLOT_SIZE);
 
-    p_glUseProgram(pipeline.prog);
+    if (dev.cur_prog != pipeline.prog) {
+        p_glUseProgram(pipeline.prog);
+        dev.cur_prog = pipeline.prog;
+    }
+    if (dev.cur_bind.size() < bindings.size()) {
+        dev.cur_bind.resize(bindings.size());
+    }
     for (size_t i = 0; i < bindings.size(); i++) {
-        const gl_binding & b = bindings[i];
-        p_glBindBufferRange(E_SHADER_STORAGE_BUFFER, (GLuint) i, b.buf, (ptrdiff_t) b.offset, (ptrdiff_t) b.size);
+        const gl_binding &           b = bindings[i];
+        gl_device_ctx::bind_state & c = dev.cur_bind[i];
+        if (c.buf != b.buf || c.offset != b.offset || c.size != b.size) {
+            p_glBindBufferRange(E_SHADER_STORAGE_BUFFER, (GLuint) i, b.buf, (ptrdiff_t) b.offset, (ptrdiff_t) b.size);
+            c = { b.buf, b.offset, b.size };
+        }
     }
     if (total_wg > 0) {
+        GLuint q = 0;
+        if (dev.profile && p_glBeginQuery) {
+            if (dev.q_free.empty()) {
+                dev.q_free.resize(256);
+                p_glGenQueries(256, dev.q_free.data());
+            }
+            q = dev.q_free.back();
+            dev.q_free.pop_back();
+            p_glBeginQuery(E_TIME_ELAPSED, q);
+        }
         p_glDispatchCompute(wg_x, wg_y, 1);
+        if (q) {
+            p_glEndQuery(E_TIME_ELAPSED);
+            dev.q_pending.emplace_back(q, pipeline.name);
+        }
         dev.n_dispatches++;
     }
     p_glMemoryBarrier(E_SHADER_STORAGE_BARRIER_BIT);
@@ -724,6 +987,7 @@ static std::string ggml_opengl_type_define(ggml_type type, const char * prefix) 
         case GGML_TYPE_MXFP4: s += "_MXFP4"; break;
         case GGML_TYPE_TQ2_0: s += "_TQ2_0"; break;
         case GGML_TYPE_Q1_0: s += "_Q1_0"; break;
+        case GGML_TYPE_Q2_0: s += "_Q2_0"; break;
         default: GGML_ABORT("ggml_opengl: unsupported type %s", ggml_type_name(type));
     }
     return s;
@@ -1151,16 +1415,23 @@ static void ggml_opengl_gated_delta_net(gl_device_ctx & dev, ggml_tensor * dst) 
     ggml_opengl_dispatch(dev, pipeline, params, { bq, bk, bv, bg, bb, bs, bd }, n_rows);
 }
 
-// RMS_NORM, and with the op name as define L2_NORM, NORM, SUM_ROWS, MEAN (all one workgroup per row)
-static void ggml_opengl_rms_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+// RMS_NORM, and with the op name as define L2_NORM, NORM, SUM_ROWS, MEAN (all one workgroup per row).
+// With w, an RMS_NORM fused with the following MUL by one f32 weight row: dst is the MUL's output.
+static void ggml_opengl_rms_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, ggml_tensor * norm = nullptr,
+                                 ggml_tensor * w = nullptr) {
+    norm = norm ? norm : dst;   // the node that holds the op and eps
     std::vector<std::string> defines;
-    if (dst->op != GGML_OP_RMS_NORM) {
-        defines.push_back(ggml_op_name(dst->op));
+    if (norm->op != GGML_OP_RMS_NORM) {
+        defines.push_back(ggml_op_name(norm->op));
+    }
+    if (w) {
+        defines.push_back("MUL_W");
     }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "rms_norm", glsl_rms_norm, defines);
 
     const gl_binding bs     = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd     = ggml_opengl_bind_tensor(dev, dst);
+    const gl_binding bw     = w ? ggml_opengl_bind_tensor(dev, w) : bs;
     const uint32_t   n_rows = (uint32_t) ggml_nrows(src);
 
     std::vector<uint32_t> params = {
@@ -1168,10 +1439,15 @@ static void ggml_opengl_rms_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_te
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
-        ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 0)),   // eps
+        ggml_opengl_u32_from_f32(ggml_get_op_params_f32(norm, 0)),   // eps
+        bw.elem_offset,
     };
     // one workgroup per row
-    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, n_rows);
+    if (w) {
+        ggml_opengl_dispatch(dev, pipeline, params, { bs, bd, bw }, n_rows);
+    } else {
+        ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, n_rows);
+    }
 }
 
 static void ggml_opengl_glu(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
@@ -1419,6 +1695,7 @@ static void ggml_opengl_flash_attn_ext(gl_device_ctx & dev, ggml_tensor * dst) {
         // GL keeps a deleted buffer alive until the dispatches that use it are done
         if (dev.fa_tmp) {
             p_glDeleteBuffers(1, &dev.fa_tmp);
+            dev.cur_bind.clear();
         }
         size_t size = 1ull << 20;
         while (size < tmp_need) {
@@ -1522,28 +1799,39 @@ static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, g
     ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd }, tiles_m * tiles_n * batches);
 }
 
-static void ggml_opengl_mul_mat(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
+// long prompts go to the tiled kernel; it needs k in whole tiles of 32
+static bool ggml_opengl_mul_mat_use_tiled(const gl_device_ctx & dev, const ggml_tensor * src0, const ggml_tensor * dst) {
+    return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols && src0->ne[0] % 32 == 0;
+}
+
+// with bias: MUL_MAT fused with the following ADD of one f32 row (mat-vec path only); dst is the ADD's output
+static void ggml_opengl_mul_mat(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst,
+                                ggml_tensor * bias = nullptr) {
     const bool quant = ggml_is_quantized(src0->type);
-    // long prompts go to the tiled kernel; it needs k in whole tiles of 32
-    if (dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols && src0->ne[0] % 32 == 0) {
+    if (ggml_opengl_mul_mat_use_tiled(dev, src0, dst)) {
+        GGML_ASSERT(!bias);
         ggml_opengl_mul_mat_tiled(dev, src0, src1, dst);
         return;
     }
     // threads per row: one unit (4 floats or one 32-wide block) per thread, power of two, at most WG_SIZE
     const uint32_t units = (uint32_t) (quant ? src0->ne[0] / 32 : src0->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < GGML_GL_WG_SIZE) {
+    while (tpr < units && tpr < dev.max_tpr) {
         tpr *= 2;
     }
     std::vector<std::string> defines = { ggml_opengl_type_define(src0->type, "SRC0"), "TPR=" + std::to_string(tpr) };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
+    if (bias) {
+        defines.push_back("ADD_BIAS");
+    }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_vec", glsl_mul_mat_vec, defines);
 
     const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
     const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const gl_binding bb = bias ? ggml_opengl_bind_tensor(dev, bias) : bd;
     const size_t     t0 = ggml_type_size(src0->type);   // block size in bytes for quant types
     const size_t     t1 = ggml_type_size(src1->type);
 
@@ -1556,12 +1844,19 @@ static void ggml_opengl_mul_mat(gl_device_ctx & dev, ggml_tensor * src0, ggml_te
         b0.elem_offset, bd.elem_offset, (uint32_t) dst->ne[0],
         (uint32_t) (src0->nb[1] / t0), (uint32_t) (src0->nb[2] / t0), (uint32_t) (src0->nb[3] / t0),
     };
+    if (bias) {
+        params.push_back(bb.elem_offset);
+    }
     const size_t   col0_idx = 10;
     const uint32_t total_wg = CEIL_DIV((uint32_t) dst->ne[0], GGML_GL_WG_SIZE / tpr) * (uint32_t) (dst->ne[2] * dst->ne[3]);
     // columns are processed 4 at a time (MAX_COLS in mul_mat_vec.comp); every chunk re-reads src0
     for (uint32_t col0 = 0; col0 < (uint32_t) dst->ne[1]; col0 += 4) {
         params[col0_idx] = col0;
-        ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd }, total_wg);
+        if (bias) {
+            ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd, bb }, total_wg);
+        } else {
+            ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd }, total_wg);
+        }
     }
 }
 
@@ -1586,6 +1881,7 @@ static bool ggml_opengl_mul_mat_id_tiled(gl_device_ctx & dev, ggml_tensor * as, 
         // GL keeps a deleted buffer alive until the dispatches that use it are done
         if (dev.mmid_scratch) {
             p_glDeleteBuffers(1, &dev.mmid_scratch);
+            dev.cur_bind.clear();
         }
         size_t size = 1ull << 16;
         while (size < need) {
@@ -1634,7 +1930,7 @@ static void ggml_opengl_mul_mat_id(gl_device_ctx & dev, ggml_tensor * dst) {
     const bool     quant = ggml_is_quantized(as->type);
     const uint32_t units = (uint32_t) (quant ? as->ne[0] / 32 : as->ne[0] / 4);
     uint32_t       tpr   = 1;
-    while (tpr < units && tpr < GGML_GL_WG_SIZE) {
+    while (tpr < units && tpr < dev.max_tpr) {
         tpr *= 2;
     }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_vec", glsl_mul_mat_vec,
@@ -1800,15 +2096,43 @@ static const char * ggml_backend_opengl_name(ggml_backend_t backend) {
     return ctx->name.c_str();
 }
 
+static void ggml_opengl_read_queries(gl_device_ctx & dev) {
+    for (auto & p : dev.q_pending) {
+        unsigned long long ns = 0;
+        p_glGetQueryObjectui64v(p.first, E_QUERY_RESULT, &ns);
+        auto & e = dev.prof[p.second];
+        e.ns += ns;
+        e.n++;
+        dev.q_free.push_back(p.first);
+    }
+    dev.q_pending.clear();
+}
+
 static void ggml_opengl_print_stats(gl_device_ctx & dev) {
     fprintf(stderr, "ggml_opengl stats [%s]: graphs %llu, nodes %llu, dispatches %llu, barriers %llu | graph_compute %.1f ms "
                     "| shader compile %.1f ms (%llu from source, %llu from the disk cache) | set_tensor %llu calls %.1f MB %.1f ms "
-                    "| get_tensor %llu calls %.1f MB %.1f ms\n",
+                    "| get_tensor %llu calls %.1f MB %.1f ms | params %s\n",
             dev.name.c_str(), (unsigned long long) dev.n_graphs, (unsigned long long) dev.n_nodes,
             (unsigned long long) dev.n_dispatches, (unsigned long long) dev.n_barriers, dev.t_graph_us / 1000.0,
             dev.t_compile_us / 1000.0, (unsigned long long) dev.n_compiles, (unsigned long long) dev.n_cache_hits,
             (unsigned long long) dev.n_set_tensor, dev.bytes_set / 1e6, dev.t_set_us / 1000.0,
-            (unsigned long long) dev.n_get_tensor, dev.bytes_get / 1e6, dev.t_get_us / 1000.0);
+            (unsigned long long) dev.n_get_tensor, dev.bytes_get / 1e6, dev.t_get_us / 1000.0,
+            dev.ubo_map ? "mapped" : "subdata");
+    if (dev.profile) {
+        std::vector<std::pair<std::string, gl_device_ctx::prof_entry>> v(dev.prof.begin(), dev.prof.end());
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.ns > b.second.ns; });
+        uint64_t total = 0, n = 0;
+        for (const auto & e : v) {
+            total += e.second.ns;
+            n += e.second.n;
+        }
+        fprintf(stderr, "ggml_opengl profile [%s]: GPU time %.1f ms in %llu timed dispatches (the last graph is not counted)\n",
+                dev.name.c_str(), total / 1e6, (unsigned long long) n);
+        for (const auto & e : v) {
+            fprintf(stderr, "  %7.1f ms %5.1f%% %8llu x %8.1f us  %s\n", e.second.ns / 1e6, total ? 100.0 * e.second.ns / total : 0.0,
+                    (unsigned long long) e.second.n, e.second.n ? e.second.ns / 1e3 / e.second.n : 0.0, e.first.c_str());
+        }
+    }
     fflush(stderr);
 }
 
@@ -1818,24 +2142,69 @@ static void ggml_backend_opengl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// RMS_NORM followed by a MUL with one f32 weight row of the same width, or a mat-vec MUL_MAT followed by an ADD
+// of one f32 bias row -> one dispatch; returns the nodes used
+static int ggml_opengl_try_fuse(gl_device_ctx & dev, const ggml_cgraph * cgraph, int i) {
+    if (dev.no_fuse) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op == GGML_OP_MUL_MAT && ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
+        ggml_tensor * add  = cgraph->nodes[i + 1];
+        ggml_tensor * bias = add->src[0] == mm ? add->src[1] : add->src[0];
+        if (mm->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(add, mm) || !ggml_is_contiguous(add) || ggml_nrows(bias) != 1 ||
+            bias->ne[0] != mm->ne[0] || bias->nb[0] != sizeof(float) || ggml_is_empty(mm) ||
+            ggml_opengl_mul_mat_use_tiled(dev, mm->src[0], mm)) {
+            return 0;
+        }
+        ggml_opengl_mul_mat(dev, mm->src[0], mm->src[1], add, bias);
+        return 2;
+    }
+    ggml_tensor * rms = cgraph->nodes[i];
+    if (rms->op != GGML_OP_RMS_NORM || !ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return 0;
+    }
+    ggml_tensor * mul = cgraph->nodes[i + 1];
+    ggml_tensor * w   = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    if (rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        rms->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, rms) || ggml_nrows(w) != 1 ||
+        w->ne[0] != rms->ne[0] || w->nb[0] != sizeof(float) || ggml_is_empty(rms)) {
+        return 0;
+    }
+    ggml_opengl_rms_norm(dev, rms->src[0], mul, rms, w);
+    return 2;
+}
+
+static void ggml_opengl_encode_graph(gl_device_ctx & dev, const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const int used = ggml_opengl_try_fuse(dev, cgraph, i);
+        if (used > 0) {
+            i += used - 1;
+            continue;
+        }
+        ggml_opengl_encode_node(dev, cgraph->nodes[i]);
+    }
+}
+
 static ggml_status ggml_backend_opengl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto *          ctx = (ggml_backend_opengl_context *) backend->context;
     gl_device_ctx & dev = *ctx->dev;
     gl_scope        scope(dev);
     const double    t0 = ggml_opengl_time_us();
+    ggml_opengl_read_queries(dev);
     if (dev.n_graphs < 4 || cgraph->n_nodes != dev.last_graph_nodes) {
         // a graph of a new shape: find the programs it needs first and build the missing ones together
         dev.collecting = true;
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_opengl_encode_node(dev, cgraph->nodes[i]);
-        }
+        ggml_opengl_encode_graph(dev, cgraph);
         dev.collecting = false;
         ggml_opengl_build_pipeline_jobs(dev);
     }
     dev.last_graph_nodes = cgraph->n_nodes;
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_opengl_encode_node(dev, cgraph->nodes[i]);
-    }
+    // buffers and programs may have been deleted (and their names reused) since the last graph
+    dev.cur_prog = 0;
+    dev.cur_bind.clear();
+    ggml_opengl_encode_graph(dev, cgraph);
     // later buffer reads, writes and copies see what the kernels wrote
     p_glMemoryBarrier(E_ALL_BARRIER_BITS);
     dev.n_barriers++;
@@ -2046,10 +2415,18 @@ static void ggml_backend_opengl_device_get_memory(ggml_backend_dev_t dev, size_t
     // device is still used (an assumption, not a measurement).
     *free  = 4ull << 30;
     *total = 4ull << 30;
+    // Mesa's software renderers expose both extensions with made-up values (llvmpipe: NVX dedicated ~1.8 TiB,
+    // avail and ATI free 32767 KiB), which would make llama.cpp fit almost nothing on the device
+    if (ctx->desc.find("llvmpipe") != std::string::npos || ctx->desc.find("softpipe") != std::string::npos) {
+        return;
+    }
+    GLint dedicated = 0, avail = 0;
     if (ctx->nvx_meminfo) {
-        GLint dedicated = 0, avail = 0;
         glGetIntegerv(E_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &dedicated);
         glGetIntegerv(E_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &avail);
+    }
+    // KiB: 64 MiB .. 1 TiB, available within dedicated
+    if (dedicated >= (64 << 10) && dedicated <= (1 << 30) && avail >= 0 && avail <= dedicated) {
         *total = (size_t) dedicated * 1024;
         *free  = (size_t) avail * 1024;
     } else if (ctx->ati_meminfo) {
@@ -2280,7 +2657,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_TQ2_0:
                 case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ1_S:
-                case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_Q1_0:
+                case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0:
                     // whole blocks per row, as the matrix-vector kernel reads them
                     return op->type == GGML_TYPE_F32 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
                            src0->nb[1] % ggml_type_size(src0->type) == 0 && src0->nb[2] % ggml_type_size(src0->type) == 0 &&
@@ -2292,7 +2669,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_MUL_MAT:
             // contiguous rows. Float weights (f32 / f16 / bf16): any k, f32 or f16 columns. Q4_0 / Q4_1 / Q5_0 / Q5_1 /
-            // Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ* / MXFP4 / TQ2_0 / Q1_0 weights: whole blocks, f32 columns
+            // Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ* / MXFP4 / TQ2_0 / Q1_0 / Q2_0 weights: whole blocks, f32 columns
             if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
                 src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K ||
                 src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
@@ -2300,7 +2677,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ2_S ||
                 src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS ||
                 src0->type == GGML_TYPE_IQ1_S || src0->type == GGML_TYPE_IQ1_M || src0->type == GGML_TYPE_MXFP4 ||
-                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_Q1_0) {
+                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) {
                 return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        src0->ne[0] % ggml_blck_size(src0->type) == 0;
@@ -2320,6 +2697,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ1_S:
                 case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_TQ2_0: case GGML_TYPE_Q1_0:
+                case GGML_TYPE_Q2_0:
                     return src0->ne[0] % ggml_blck_size(src0->type) == 0;
                 case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
                     return true;
@@ -2390,6 +2768,69 @@ static void APIENTRY ggml_opengl_debug_cb(GLenum src, GLenum type, GLuint id, GL
     GGML_LOG_WARN("ggml_opengl: [gl debug] src 0x%x type 0x%x id %u sev 0x%x: %s\n", src, type, id, sev, msg);
 }
 
+#ifndef _WIN32
+static void ggml_opengl_destroy_context(gl_device_ctx & dev) {
+    if (dev.dpy) {
+        p_eglMakeCurrent(dev.dpy, nullptr, nullptr, nullptr);
+        if (dev.ctx) {
+            p_eglDestroyContext(dev.dpy, dev.ctx);
+            dev.ctx = nullptr;
+        }
+        p_eglTerminate(dev.dpy);
+        dev.dpy = nullptr;
+    }
+}
+
+// Surfaceless EGL display (EGL_MESA_platform_surfaceless), core 4.6 .. 4.3 context without a config
+// (EGL_KHR_no_config_context) and without a surface (EGL_KHR_surfaceless_context).
+// Leaves the new context current on this thread.
+static bool ggml_opengl_create_context(gl_device_ctx & dev) {
+    if (!g_libegl) {
+        g_libegl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!g_libegl) {
+            GGML_LOG_WARN("ggml_opengl: libEGL.so.1 not found, no OpenGL device\n");
+            return false;
+        }
+#define GGML_EGL_LOAD(ret, name, args) p_##name = (ret (*) args) dlsym(g_libegl, #name);
+        GGML_EGL_FUNCS(GGML_EGL_LOAD)
+#undef GGML_EGL_LOAD
+    }
+#define GGML_EGL_CHECK(ret, name, args) \
+    if (!p_##name) { GGML_LOG_WARN("ggml_opengl: libEGL has no %s, no OpenGL device\n", #name); return false; }
+    GGML_EGL_FUNCS(GGML_EGL_CHECK)
+#undef GGML_EGL_CHECK
+    dev.dpy = p_eglGetPlatformDisplay(E_EGL_PLATFORM_SURFACELESS_MESA, nullptr, nullptr);
+    EGLint major = 0, minor = 0;
+    if (!dev.dpy || !p_eglInitialize(dev.dpy, &major, &minor)) {
+        GGML_LOG_WARN("ggml_opengl: no surfaceless EGL display (error 0x%x), no OpenGL device\n", (unsigned) p_eglGetError());
+        dev.dpy = nullptr;
+        return false;
+    }
+    const char * exts = p_eglQueryString(dev.dpy, E_EGL_EXTENSIONS);
+    if (!exts || !strstr(exts, "EGL_KHR_no_config_context") || !strstr(exts, "EGL_KHR_surfaceless_context") ||
+        !p_eglBindAPI(E_EGL_OPENGL_API)) {
+        GGML_LOG_WARN("ggml_opengl: EGL %d.%d lacks desktop GL, no_config or surfaceless contexts\n", major, minor);
+        ggml_opengl_destroy_context(dev);
+        return false;
+    }
+    const int vers[][2] = { { 4, 6 }, { 4, 5 }, { 4, 4 }, { 4, 3 } };
+    for (const auto & v : vers) {
+        const EGLint attr[] = { E_EGL_CONTEXT_MAJOR_VERSION, v[0], E_EGL_CONTEXT_MINOR_VERSION, v[1],
+                                E_EGL_CONTEXT_OPENGL_PROFILE_MASK, E_EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                                E_EGL_CONTEXT_OPENGL_DEBUG, dev.debug ? 1 : 0, E_EGL_NONE };
+        dev.ctx = p_eglCreateContext(dev.dpy, nullptr, nullptr, attr);
+        if (dev.ctx) {
+            break;
+        }
+    }
+    if (!dev.ctx || !p_eglMakeCurrent(dev.dpy, nullptr, nullptr, dev.ctx)) {
+        GGML_LOG_WARN("ggml_opengl: no core 4.3+ context (EGL error 0x%x)\n", (unsigned) p_eglGetError());
+        ggml_opengl_destroy_context(dev);
+        return false;
+    }
+    return true;
+}
+#else
 static LRESULT CALLBACK ggml_opengl_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
 }
@@ -2488,10 +2929,17 @@ static bool ggml_opengl_create_context(gl_device_ctx & dev) {
     }
     return true;
 }
+#endif
 
 static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml_dev) {
     dev.debug = ggml_opengl_getenv("DEBUG") != nullptr;
     dev.stats = ggml_opengl_getenv("STATS") != nullptr;
+    dev.profile = ggml_opengl_getenv("PROFILE") != nullptr;
+#ifdef GGML_OPENGL_PROFILE_DEFAULT
+    // diagnostic builds for the test boxes, whose launcher cannot set environment variables
+    dev.profile = true;
+#endif
+    dev.stats   = dev.stats || dev.profile;
     if (!ggml_opengl_create_context(dev)) {
         return false;
     }
@@ -2564,10 +3012,41 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     if (const char * env = ggml_opengl_getenv("TILED")) {
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
     }
+    if (const char * env = ggml_opengl_getenv("NO_FUSE")) {
+        dev.no_fuse = atoi(env) != 0;
+    }
+    if (const char * env = ggml_opengl_getenv("MAX_TPR")) {
+        // power of two in 1..WG_SIZE
+        const int v = atoi(env);
+        dev.max_tpr = 1;
+        while (dev.max_tpr * 2 <= (uint32_t) std::max(1, std::min(v, GGML_GL_WG_SIZE))) {
+            dev.max_tpr *= 2;
+        }
+    }
 
     p_glGenBuffers(1, &dev.ubo);
     p_glBindBuffer(E_UNIFORM_BUFFER, dev.ubo);
-    p_glBufferData(E_UNIFORM_BUFFER, (ptrdiff_t) (dev.param_slot * GGML_GL_PARAM_SLOT_COUNT), nullptr, E_DYNAMIC_DRAW);
+    const size_t ubo_size = dev.param_slot * GGML_GL_PARAM_SLOT_COUNT;
+    const char * persist  = ggml_opengl_getenv("PARAM_PERSIST");
+    if (p_glBufferStorage && p_glMapBufferRange && p_glFenceSync && p_glClientWaitSync && p_glDeleteSync &&
+        !(persist && atoi(persist) == 0)) {
+        const GLbitfield flags = E_MAP_WRITE_BIT | E_MAP_PERSISTENT_BIT | E_MAP_COHERENT_BIT;
+        p_glBufferStorage(E_UNIFORM_BUFFER, (ptrdiff_t) ubo_size, nullptr, flags);
+        if (glGetError() == GL_NO_ERROR) {
+            dev.ubo_map = (uint8_t *) p_glMapBufferRange(E_UNIFORM_BUFFER, 0, (ptrdiff_t) ubo_size, flags);
+        }
+        if (!dev.ubo_map) {
+            // storage is immutable once set: start over with a new buffer
+            while (glGetError() != GL_NO_ERROR) {
+            }
+            p_glDeleteBuffers(1, &dev.ubo);
+            p_glGenBuffers(1, &dev.ubo);
+            p_glBindBuffer(E_UNIFORM_BUFFER, dev.ubo);
+        }
+    }
+    if (!dev.ubo_map) {
+        p_glBufferData(E_UNIFORM_BUFFER, (ptrdiff_t) ubo_size, nullptr, E_DYNAMIC_DRAW);
+    }
     if (glGetError() != GL_NO_ERROR) {
         GGML_LOG_WARN("ggml_opengl: parameter buffer allocation failed, no OpenGL device\n");
         ggml_opengl_destroy_context(dev);
@@ -2604,11 +3083,26 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
                   dev.name.c_str(), dev.desc.c_str(), dev.version.c_str(),
                   (const char *) glGetString(E_SHADING_LANGUAGE_VERSION), dev.max_alloc >> 20, ssbo_align,
                   dev.parallel ? "yes" : "no", dev.prog_binary ? "yes" : "no", __DATE__, __TIME__);
+    {
+        // raw vendor memory info (KiB), the source of get_memory; none -> get_memory reports 4 GiB
+        GLint nvx_total = -1, nvx_avail = -1, ati[4] = { -1, -1, -1, -1 };
+        if (dev.nvx_meminfo) {
+            glGetIntegerv(E_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX, &nvx_total);
+            glGetIntegerv(E_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX, &nvx_avail);
+        }
+        if (dev.ati_meminfo) {
+            glGetIntegerv(E_VBO_FREE_MEMORY_ATI, ati);
+        }
+        GGML_LOG_INFO("ggml_opengl: %s meminfo: NVX %s dedicated %d KiB avail %d KiB | ATI %s vbo free %d KiB largest %d KiB\n",
+                      dev.name.c_str(), dev.nvx_meminfo ? "yes" : "no", nvx_total, nvx_avail,
+                      dev.ati_meminfo ? "yes" : "no", ati[0], ati[1]);
+    }
     // other threads make the context current when they need it
-    wglMakeCurrent(nullptr, nullptr);
+    ggml_opengl_release_current(dev);
     return true;
 }
 
+#ifdef _WIN32
 static int __cdecl ggml_opengl_process_exit() {
     if (g_reg_ctx) {
         for (auto & dev : g_reg_ctx->devs) {
@@ -2618,6 +3112,7 @@ static int __cdecl ggml_opengl_process_exit() {
     }
     return 0;
 }
+#endif
 
 static void ggml_opengl_enumerate(ggml_backend_opengl_reg_context & reg_ctx, ggml_backend_reg_t reg) {
     // WGL gives one context on the driver of the primary display: one device
@@ -2639,12 +3134,14 @@ static void ggml_opengl_enumerate(ggml_backend_opengl_reg_context & reg_ctx, ggm
     // live contexts through the detached ICD: a call to 0 on the MTT S80 (exp33). Delete the contexts in the
     // process exit handlers instead, which run before ExitProcess; a DLL's own atexit only runs at its detach.
     // Pin this DLL so the handler cannot outlive it.
+#ifdef _WIN32
     HMODULE self = nullptr;
     auto crt_onexit = (_onexit_t (__cdecl *)(_onexit_t)) (void *) GetProcAddress(GetModuleHandleA("msvcrt.dll"), "_onexit");
     if (crt_onexit && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                                          (LPCSTR) &ggml_opengl_process_exit, &self)) {
         crt_onexit(ggml_opengl_process_exit);
     }
+#endif
 }
 
 static const char * ggml_backend_opengl_reg_get_name(ggml_backend_reg_t reg) {

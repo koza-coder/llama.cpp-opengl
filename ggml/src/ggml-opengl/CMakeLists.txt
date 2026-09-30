@@ -36,5 +36,10 @@ add_dependencies(ggml-opengl generate_opengl_shaders)
 
 target_compile_features(ggml-opengl PRIVATE cxx_std_17)
 target_include_directories(ggml-opengl PRIVATE ${SHADER_OUTPUT_DIR})
-# WGL only for now; every GL function past 1.1 is loaded with wglGetProcAddress (no GLAD/GLEW)
-target_link_libraries(ggml-opengl PRIVATE opengl32 gdi32 user32)
+# every GL function past 1.1 is loaded with wglGetProcAddress (Windows) or eglGetProcAddress (Linux, libEGL
+# opened at run time); no GLAD/GLEW and no GL/EGL headers needed
+if (WIN32)
+    target_link_libraries(ggml-opengl PRIVATE opengl32 gdi32 user32)
+else()
+    target_link_libraries(ggml-opengl PRIVATE ${CMAKE_DL_LIBS})
+endif()
