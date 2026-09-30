@@ -1,7 +1,7 @@
 #include "common.glsl"
 
 // Port of the D3D11 get_rows.hlsl: dst[i1, i2, i3] = src[idx[i1, i2, i3], i2, i3]; idx is i32, one
-// thread per element. defines: SRC_{F32,F16,I32}
+// thread per element. defines: SRC_{F32,F16,BF16,I32}
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -58,5 +58,9 @@ void main() {
     uint bits;
     LOAD_U16_UNALIGNED(src, (src_row + u) * 2u, bits);
     STORE_F32(dst, dst_row + u, f16_to_f32(bits));
+#elif defined(SRC_BF16)
+    uint bits;
+    LOAD_U16_UNALIGNED(src, (src_row + u) * 2u, bits);
+    STORE_F32(dst, dst_row + u, uintBitsToFloat(bits << 16));
 #endif
 }

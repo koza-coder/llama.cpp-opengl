@@ -1,0 +1,49 @@
+#include "common.glsl"
+
+// DSV4_HC_PRE (hyper-connections): dst[i, t] = scale * sum_h x[i, h, t] * w, one thread per output.
+// w = weights[h, t], or with GATED sigmoid(gate[i, h, t]). f32; offsets and strides in elements.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer X   { uint x_buf[]; };
+layout(std430, binding = 1) buffer Wt  { uint w_buf[]; };
+layout(std430, binding = 2) buffer Dst { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_x;
+    uint offset_w;
+    uint offset_dst;
+
+    uint stride_x1;
+    uint stride_x2;
+    uint stride_w1;
+    uint stride_w2;
+    uint stride_d1;
+
+    uint n_embd;
+    uint hc;
+    uint n_out;
+    float scale;
+
+    uint nwg_x;
+};
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= n_out) {
+        return;
+    }
+    uint i0 = i % n_embd;
+    uint t  = i / n_embd;
+    float sum = 0.0;
+    for (uint h = 0u; h < hc; h++) {
+        float xv = LOAD_F32(x_buf, offset_x + i0 + h * stride_x1 + t * stride_x2);
+#if defined(GATED)
+        float wv = 1.0 / (1.0 + exp(-LOAD_F32(w_buf, offset_w + i0 + h * stride_w1 + t * stride_w2)));
+#else
+        float wv = LOAD_F32(w_buf, offset_w + h + t * stride_w1);
+#endif
+        sum += xv * wv;
+    }
+    STORE_F32(dst, offset_dst + i0 + t * stride_d1, scale * sum);
+}

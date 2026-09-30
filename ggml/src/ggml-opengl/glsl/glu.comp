@@ -1,6 +1,6 @@
 #include "common.glsl"
 
-// Port of the D3D11 glu.hlsl. defines: TYPE_F32 or TYPE_F16, OP_{REGLU,GEGLU,SWIGLU,SWIGLU_OAI,GEGLU_ERF,
+// Port of the D3D11 glu.hlsl. defines: TYPE_F32 or TYPE_F16, OP_{REGLU,GEGLU,SWIGLU,SWIGLU_OAI,SWIGLU_CLAMP,GEGLU_ERF,
 // GEGLU_QUICK}, NO_SPLIT when both halves come from src0
 
 #if defined(TYPE_F16)
@@ -58,6 +58,9 @@ float op(float a, float b) {
     float xi = min(a, limit);
     float gi = max(min(b, limit), -limit);
     return xi / (1.0 + exp(-xi * alpha)) * (1.0 + gi);
+#elif defined(OP_SWIGLU_CLAMP)
+    float g = min(a, limit);
+    return g / (1.0 + exp(-g)) * clamp(b, -limit, limit);
 #elif defined(OP_GEGLU_ERF)
     float x   = abs(a * 0.7071067811865476);
     float sgn = a >= 0.0 ? 1.0 : -1.0;

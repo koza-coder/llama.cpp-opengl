@@ -1,0 +1,47 @@
+#include "common.glsl"
+
+// Port of the D3D12 argsort.hlsl. ARGSORT and TOP_K (f32 -> i32), one workgroup per row: every element computes
+// its own rank, so no sorting network, and writes its index to dst[rank] when rank < k_out (k_out = ne0 for
+// ARGSORT). Ties keep the smaller source index first. defines: SORT_DESC (TOP_K always sorts descending)
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Src { uint src[]; };
+layout(std430, binding = 1) buffer Dst { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_src;
+    uint offset_dst;
+    uint stride_src1;
+    uint ne0;
+    uint k_out;
+    uint n_rows;
+    uint nwg_x;
+};
+
+void main() {
+    const uint r = gl_WorkGroupID.y * nwg_x + gl_WorkGroupID.x;
+    if (r >= n_rows) {
+        return;
+    }
+    const uint src_row = offset_src + r * stride_src1;
+    const uint dst_row = offset_dst + r * k_out;
+    for (uint i = gl_LocalInvocationID.x; i < ne0; i += uint(WG_SIZE)) {
+        const float v = LOAD_F32(src, src_row + i);
+        uint rank = 0u;
+        for (uint j = 0u; j < ne0; j++) {
+            const float w = LOAD_F32(src, src_row + j);
+#if defined(SORT_DESC)
+            const bool before = w > v || (w == v && j < i);
+#else
+            const bool before = w < v || (w == v && j < i);
+#endif
+            if (before) {
+                rank++;
+            }
+        }
+        if (rank < k_out) {
+            STORE_I32(dst, dst_row + rank, int(i));
+        }
+    }
+}
