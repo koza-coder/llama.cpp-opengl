@@ -333,11 +333,13 @@ struct gl_device_ctx {
     size_t   bind_align   = GGML_GL_BINDING_ALIGNMENT;
     size_t   param_slot   = GGML_GL_PARAM_SLOT_SIZE;
     bool     debug        = false;
+    bool     trace        = false;   // GGML_OPENGL_TRACE: print + flush every node, alloc and copy, glFinish per node
     bool     parallel     = false;   // GL_ARB/KHR_parallel_shader_compile
     bool     prog_binary  = false;   // at least one program binary format
     bool     ati_meminfo  = false;
     bool     nvx_meminfo  = false;
     uint32_t tiled_min_cols = GGML_GL_TILED_DEFAULT;
+    uint32_t tiled_ksplit   = 0;   // tiles of k per tiled-matmul dispatch (1, 2, 4 or 8); 0 = one dispatch, loop in the shader
     uint32_t max_tpr        = GGML_GL_MAX_TPR;
     bool     no_fuse        = false;   // GGML_OPENGL_NO_FUSE: every node on its own
 
@@ -711,8 +713,9 @@ static std::string ggml_opengl_pipeline_key(const std::string & name, const std:
 
 // Builds the queued programs: cache hits load their binary, the rest are all compiled and linked before
 // any status is read, so a driver with parallel_shader_compile works on all of them at once. Needs the
-// context current.
-static void ggml_opengl_build_pipeline_jobs(gl_device_ctx & dev) {
+// context current. skip_failed (prewarm): a program that no longer builds (a key listed by an older build) is
+// dropped with a warning instead of aborting.
+static void ggml_opengl_build_pipeline_jobs(gl_device_ctx & dev, bool skip_failed = false) {
     std::vector<gl_device_ctx::pipeline_job> jobs;
     jobs.swap(dev.pipeline_jobs);
     if (jobs.empty()) {
@@ -753,6 +756,12 @@ static void ggml_opengl_build_pipeline_jobs(gl_device_ctx & dev) {
         const auto & j  = jobs[c.job];
         GLint        ok = 0;
         p_glGetShaderiv(c.shader, E_COMPILE_STATUS, &ok);
+        if (!ok && skip_failed) {
+            GGML_LOG_WARN("ggml_opengl: listed program %s does not build any more, skipped\n", j.key.c_str());
+            p_glDeleteProgram(c.prog);
+            p_glDeleteShader(c.shader);
+            continue;
+        }
         if (!ok) {
             GGML_LOG_ERROR("ggml_opengl: shader compilation failed for %s:\n%s\n", j.key.c_str(),
                            ggml_opengl_info_log(c.shader, false).c_str());
@@ -842,7 +851,7 @@ static void ggml_opengl_prewarm(gl_device_ctx & dev) {
     fclose(f);
     if (!dev.pipeline_jobs.empty()) {
         GGML_LOG_INFO("ggml_opengl: building %zu listed programs\n", dev.pipeline_jobs.size());
-        ggml_opengl_build_pipeline_jobs(dev);
+        ggml_opengl_build_pipeline_jobs(dev, true);
     }
 }
 
@@ -1110,6 +1119,24 @@ static void ggml_opengl_pad(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor 
         (uint32_t) ggml_get_op_params_i32(dst, 4), (uint32_t) ggml_get_op_params_i32(dst, 6),
     };
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+// ROLL: cyclic shift along all four axes, one workgroup per destination row (port of the D3D12 encoder)
+static void ggml_opengl_roll(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    gl_pipeline &    pipeline = ggml_opengl_get_pipeline(dev, "roll", glsl_roll, {});
+    const gl_binding bs       = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd       = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   n_rows   = (uint32_t) ggml_nrows(dst);
+    const std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], (uint32_t) dst->ne[3],
+        (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 1),
+        (uint32_t) ggml_get_op_params_i32(dst, 2), (uint32_t) ggml_get_op_params_i32(dst, 3),
+        n_rows,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, n_rows);
 }
 
 static void ggml_opengl_im2col(gl_device_ctx & dev, ggml_tensor * dst) {
@@ -1776,7 +1803,6 @@ static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, g
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
     }
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_tiled", glsl_mul_mat_tiled, defines);
 
     const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
     const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
@@ -1796,7 +1822,25 @@ static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, g
     const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], 64u);
     const uint32_t tiles_n = CEIL_DIV((uint32_t) dst->ne[1], 32u);
     const uint32_t batches = (uint32_t) (dst->ne[2] * dst->ne[3]);
-    ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd }, tiles_m * tiles_n * batches);
+    if (dev.tiled_ksplit == 0) {
+        gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_tiled", glsl_mul_mat_tiled, defines);
+        ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd }, tiles_m * tiles_n * batches);
+        return;
+    }
+    // no loop around barriers (MTT S80): one dispatch per tiled_ksplit tiles of k, single tiles for the rest; the
+    // passes after the first add to dst
+    const uint32_t k = (uint32_t) src0->ne[0];
+    defines.push_back("KSPLIT");
+    for (uint32_t k0 = 0; k0 < k;) {
+        const uint32_t steps = k - k0 >= dev.tiled_ksplit * 32 ? dev.tiled_ksplit : 1;
+        std::vector<std::string> d = defines;
+        d.push_back("K_STEPS=" + std::to_string(steps));
+        gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_tiled", glsl_mul_mat_tiled, d);
+        std::vector<uint32_t> p = params;
+        p.push_back(k0);
+        ggml_opengl_dispatch(dev, pipeline, p, { b1, b0, bd }, tiles_m * tiles_n * batches);
+        k0 += steps * 32;
+    }
 }
 
 // long prompts go to the tiled kernel; it needs k in whole tiles of 32
@@ -1869,7 +1913,7 @@ static bool ggml_opengl_mul_mat_id_tiled(gl_device_ctx & dev, ggml_tensor * as, 
     const uint32_t n_tokens  = (uint32_t) ids->ne[1];
     const uint32_t n_experts = (uint32_t) as->ne[2];
     // MAX_EXPERTS in mul_mat_id_prep.comp
-    if (dev.tiled_min_cols == 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
+    if (dev.tiled_min_cols == 0 || dev.tiled_ksplit != 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
         as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -2046,6 +2090,9 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_PAD:
             ggml_opengl_pad(dev, node->src[0], node);
             return;
+        case GGML_OP_ROLL:
+            ggml_opengl_roll(dev, node->src[0], node);
+            return;
         case GGML_OP_IM2COL:
             ggml_opengl_im2col(dev, node);
             return;
@@ -2178,12 +2225,28 @@ static int ggml_opengl_try_fuse(gl_device_ctx & dev, const ggml_cgraph * cgraph,
 
 static void ggml_opengl_encode_graph(gl_device_ctx & dev, const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (dev.trace && !dev.collecting) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            fprintf(stderr, "gl-trace: node %d/%d %s %s %s ne [%lld %lld %lld %lld] src0 %s src1 %s\n", i, cgraph->n_nodes,
+                    ggml_op_desc(n), n->name, ggml_type_name(n->type), (long long) n->ne[0], (long long) n->ne[1],
+                    (long long) n->ne[2], (long long) n->ne[3], n->src[0] ? ggml_type_name(n->src[0]->type) : "-",
+                    n->src[1] ? ggml_type_name(n->src[1]->type) : "-");
+            fflush(stderr);
+        }
         const int used = ggml_opengl_try_fuse(dev, cgraph, i);
+        if (dev.trace && !dev.collecting) {
+            glFinish();
+        }
         if (used > 0) {
             i += used - 1;
             continue;
         }
         ggml_opengl_encode_node(dev, cgraph->nodes[i]);
+        if (dev.trace && !dev.collecting) {
+            glFinish();
+            fprintf(stderr, "gl-trace: node %d done\n", i);
+            fflush(stderr);
+        }
     }
 }
 
@@ -2191,6 +2254,10 @@ static ggml_status ggml_backend_opengl_graph_compute(ggml_backend_t backend, str
     auto *          ctx = (ggml_backend_opengl_context *) backend->context;
     gl_device_ctx & dev = *ctx->dev;
     gl_scope        scope(dev);
+    if (dev.trace) {
+        fprintf(stderr, "gl-trace: graph_compute %d nodes\n", cgraph->n_nodes);
+        fflush(stderr);
+    }
     const double    t0 = ggml_opengl_time_us();
     ggml_opengl_read_queries(dev);
     if (dev.n_graphs < 4 || cgraph->n_nodes != dev.last_graph_nodes) {
@@ -2286,6 +2353,11 @@ static void ggml_backend_opengl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     gl_scope     scope(dev);
+    if (dev.trace) {
+        fprintf(stderr, "gl-trace: set_tensor %s %s offset %zu size %zu buf %zu\n", tensor->name, ggml_type_name(tensor->type),
+                (size_t) ggml_opengl_tensor_offset(tensor) + offset, size, ctx->size);
+        fflush(stderr);
+    }
     const double t0 = ggml_opengl_time_us();
     p_glBindBuffer(E_COPY_WRITE_BUFFER, ctx->buf);
     p_glBufferSubData(E_COPY_WRITE_BUFFER, (ptrdiff_t) (ggml_opengl_tensor_offset(tensor) + offset), (ptrdiff_t) size, data);
@@ -2302,6 +2374,11 @@ static void ggml_backend_opengl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     gl_scope     scope(dev);
+    if (dev.trace) {
+        fprintf(stderr, "gl-trace: get_tensor %s offset %zu size %zu buf %zu\n", tensor->name,
+                (size_t) ggml_opengl_tensor_offset(tensor) + offset, size, ctx->size);
+        fflush(stderr);
+    }
     const double t0 = ggml_opengl_time_us();
     p_glBindBuffer(E_COPY_READ_BUFFER, ctx->buf);
     p_glGetBufferSubData(E_COPY_READ_BUFFER, (ptrdiff_t) (ggml_opengl_tensor_offset(tensor) + offset), (ptrdiff_t) size, data);
@@ -2368,6 +2445,10 @@ static ggml_backend_buffer_t ggml_backend_opengl_buffer_type_alloc_buffer(ggml_b
 
     // slack past the end: kernels read unaligned values as two whole words
     const size_t alloc_size = std::max(dev->bind_align, (size + dev->bind_align - 1) & ~(dev->bind_align - 1)) + GGML_GL_BUFFER_SLACK;
+    if (dev->trace) {
+        fprintf(stderr, "gl-trace: alloc_buffer %zu bytes (alloc %zu)\n", size, alloc_size);
+        fflush(stderr);
+    }
     while (glGetError() != GL_NO_ERROR) {}
     GLuint buf = 0;
     p_glGenBuffers(1, &buf);
@@ -2572,6 +2653,10 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 }
                 return ok;
             }
+        case GGML_OP_ROLL:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
+                   ggml_are_same_shape(src0, op);
         case GGML_OP_PAD:
             // dst is addressed by a flat index, as the CPU does; src keeps its strides
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
@@ -2935,6 +3020,11 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     dev.debug = ggml_opengl_getenv("DEBUG") != nullptr;
     dev.stats = ggml_opengl_getenv("STATS") != nullptr;
     dev.profile = ggml_opengl_getenv("PROFILE") != nullptr;
+    dev.trace   = ggml_opengl_getenv("TRACE") != nullptr;
+#ifdef GGML_OPENGL_TRACE_DEFAULT
+    // diagnostic builds for the test boxes, whose launcher cannot set environment variables
+    dev.trace = true;
+#endif
 #ifdef GGML_OPENGL_PROFILE_DEFAULT
     // diagnostic builds for the test boxes, whose launcher cannot set environment variables
     dev.profile = true;
@@ -2950,10 +3040,11 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     }
     dev.desc    = (const char *) glGetString(GL_RENDERER);
     dev.version = (const char *) glGetString(GL_VERSION);
-    // Moore Threads: the driver's compiler aborts on the tiled matmul's barriers, with a runtime or a constant loop
-    // bound ("LLVM ERROR: barrierOp in dynamic branch", exp43/exp44), so all matmuls use the mat-vec kernel there
+    // Moore Threads: the driver's compiler aborts on the tiled matmul's barriers inside a loop, with a runtime or a
+    // constant bound ("LLVM ERROR: barrierOp in dynamic branch", exp43/exp44), so the tiled matmul runs its k loop
+    // as one dispatch per 4 tiles there (exp91); mul_mat_id stays on the mat-vec kernel
     if (dev.desc.find("Moore Threads") != std::string::npos) {
-        dev.tiled_min_cols = 0;
+        dev.tiled_ksplit = 4;
     }
 
     std::map<std::string, bool> exts;
@@ -3011,6 +3102,10 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     }
     if (const char * env = ggml_opengl_getenv("TILED")) {
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
+    }
+    if (const char * env = ggml_opengl_getenv("KSPLIT")) {
+        const int v = atoi(env);
+        dev.tiled_ksplit = v == 1 || v == 2 || v == 4 || v == 8 ? (uint32_t) v : 0;
     }
     if (const char * env = ggml_opengl_getenv("NO_FUSE")) {
         dev.no_fuse = atoi(env) != 0;

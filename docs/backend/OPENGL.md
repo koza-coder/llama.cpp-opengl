@@ -10,13 +10,13 @@ driver offers an OpenGL 4.3 (or newer) core context, including GPUs without Vulk
 
 ## Status
 
-Tested with release v0.0.3:
+Tested with release v0.0.5:
 
 | GPU | Result |
 |---|---|
-| AMD Radeon AI PRO R9700 | new op groups pass (flash attention 3260, MUL_MAT_ID 768, GET_ROWS, IM2COL, FILL, ROPE_BACK, SWIGLU_CLAMP); qwen2.5-0.5b q4_0 PPL 17.29, pp512 5948 / tg64 86 tok/s; SmolVLM-500M (image) and Qwen3-ASR (speech) correct |
-| Intel Iris Xe | new op groups pass (MUL_MAT not run, too slow on that machine); qwen2.5-0.5b q4_0 PPL 17.29, pp512 323 / tg64 6.5 tok/s; SmolVLM-500M and Qwen3-ASR correct |
-| Moore Threads MTT S80 | not tested with v0.0.3 (offline). v0.0.2: flash attention and quantized MUL_MAT pass; 37 f32 MUL_MAT broadcast cases fail; the tiled prompt kernel is off on this GPU |
+| AMD Radeon AI PRO R9700 | every exe in the zip runs; MUL_MAT 1265/1265, MUL_MAT_ID 843/843, flash attention 3260/3260; qwen2.5-0.5b q4_0 PPL 17.29, pp512 6639 / tg64 129 tok/s; SmolVLM-500M (image) and Qwen3-ASR (speech) correct |
+| Moore Threads MTT S80 | every exe in the zip runs; GET_ROWS, RMS_NORM+MUL+ADD, SOFT_MAX, ROPE pass; qwen2.5-0.5b q4_0 PPL 17.29, pp512 788 / tg64 31 tok/s; SmolVLM-500M and Qwen3-ASR correct |
+| Intel Iris Xe | not tested with v0.0.5 (offline); v0.0.3: new op groups pass, qwen2.5-0.5b q4_0 PPL 17.29, SmolVLM-500M and Qwen3-ASR correct |
 
 Ops the backend does not support run on the CPU (the ggml scheduler does this automatically). The authoritative list
 of supported ops and types is `ggml_backend_opengl_device_supports_op` in `ggml-opengl.cpp`.
@@ -76,7 +76,8 @@ Compares every supported op against the CPU backend. `-o MUL_MAT` (or any op nam
 | Variable | Effect |
 |---|---|
 | `GGML_OPENGL_NO_SHADER_CACHE` | do not read or write the compiled shader cache (`opengl-shader-cache` next to the exe) |
-| `GGML_OPENGL_TILED=<n>` | use the tiled matmul from `n` columns up (0 = off); default 16, off on Moore Threads |
+| `GGML_OPENGL_TILED=<n>` | use the tiled matmul from `n` columns up (0 = off); default 16 |
+| `GGML_OPENGL_KSPLIT=<n>` | run the tiled matmul's k loop as one dispatch per `n` tiles (1, 2, 4 or 8; other values = off, one dispatch). Default 4 on Moore Threads, whose shader compiler rejects a barrier inside a loop; off elsewhere |
 | `GGML_OPENGL_MAX_ALLOC_MB=<n>` | cap the size of one GPU buffer |
 | `GGML_OPENGL_STATS` | print counters (graphs, dispatches, barriers, graph time, shader compiles vs. cache hits, transfers) |
 | `GGML_OPENGL_DEBUG` | enable the GL debug output callback (when the driver provides a debug context) |
@@ -84,5 +85,6 @@ Compares every supported op against the CPU backend. `-o MUL_MAT` (or any op nam
 | `GGML_OPENGL_NO_FUSE` | do not fuse RMS_NORM + MUL and mat-vec MUL_MAT + bias ADD |
 | `GGML_OPENGL_PARAM_PERSIST=0` | write dispatch parameters with glBufferSubData instead of the persistent mapped ring |
 | `GGML_OPENGL_MAX_TPR=<n>` | cap the matrix-vector threads per row (power of two, default 256) |
+| `GGML_OPENGL_TRACE` | print and flush every node, buffer allocation and tensor copy, with a glFinish after each node (for locating crashes; slow) |
 
 The first run compiles the shaders; later runs load them from the disk cache.
