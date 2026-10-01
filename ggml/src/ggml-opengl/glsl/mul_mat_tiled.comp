@@ -10,6 +10,9 @@
 // defines: SRC0_{F32,F16,BF16,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,
 //          IQ4_NL,IQ4_XS,IQ3_S,IQ2_S,IQ2_XXS,IQ2_XS,IQ3_XXS,IQ1_S,IQ1_M,MXFP4,TQ2_0}, SRC1_F16 (f16 columns instead of f32). k must be a multiple
 // of TILE_K. MMID: mul_mat_id, one expert tile of the mul_mat_id_prep.comp table per workgroup.
+// KSPLIT (not with MMID): the dispatch covers only K_STEPS tiles of k from k_begin, with no loop around the barriers
+// (the MTT S80 compiler aborts on a barrier inside any loop it does not unroll); the host dispatches once per chunk
+// and each pass after the first adds to dst.
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
 #define TILE_M 64
@@ -59,6 +62,9 @@ layout(std140, binding = 0) uniform Params {
     uint dst_s1;      // dst->nb[1] in elements
     uint dst_s2;      // dst->nb[2] in elements
     uint list_base;   // first list entry in scratch
+#endif
+#if defined(KSPLIT)
+    uint k_begin;     // first k of this pass; 0 = store, else add to dst
 #endif
     uint nwg_x;
 };
@@ -648,6 +654,46 @@ void load_a_row(uint row_base, uint k0, uint col) {
 #endif
 }
 
+// one TILE_K step of k at kt: stage both tiles, then accumulate into acc
+float acc[REG_M][REG_N];
+
+void k_step(uint kt, uint tid, uint tx, uint ty, uint row0, uint a_batch, bool b_ok, uint b_base, uint b_part, uint b_col) {
+    if (tid < uint(TILE_M)) {
+        uint r = row0 + tid;
+        if (r < m) {
+            load_a_row(a_batch + r * stride_01, kt, tid);
+        } else {
+            for (uint z = 0u; z < uint(TILE_K); z++) {
+                Atile[z][tid] = 0.0;
+            }
+        }
+    }
+    for (uint i = 0u; i < 4u; i++) {
+        uint ki = b_part * 4u + i;
+        Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    for (uint kk = 0u; kk < uint(TILE_K); kk++) {
+        float a[REG_M];
+        float b[REG_N];
+        for (uint im2 = 0u; im2 < uint(REG_M); im2++) {
+            a[im2] = Atile[kk][ty * uint(REG_M) + im2];
+        }
+        for (uint in2 = 0u; in2 < uint(REG_N); in2++) {
+            b[in2] = Btile[kk][tx * uint(REG_N) + in2];
+        }
+        for (uint im3 = 0u; im3 < uint(REG_M); im3++) {
+            for (uint in3 = 0u; in3 < uint(REG_N); in3++) {
+                acc[im3][in3] += a[im3] * b[in3];
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+}
+
 void main() {
     uint tid       = gl_LocalInvocationID.x;
     uint tx        = tid % uint(TH_X);          // column group
@@ -703,7 +749,6 @@ void main() {
     uint b_base  = b_batch + (col0 + b_col) * stride_11;
 #endif
 
-    float acc[REG_M][REG_N];
     for (uint im = 0u; im < uint(REG_M); im++) {
         for (uint jn = 0u; jn < uint(REG_N); jn++) {
             acc[im][jn] = 0.0;
@@ -712,42 +757,40 @@ void main() {
 
     // the loop bound is the uniform k for every workgroup: the MTT S80 compiler aborts on a barrier inside a loop
     // whose bound depends on the workgroup ("barrierOp in dynamic branch"). Overshoot workgroups read batch 0.
-    for (uint kt = 0u; kt < k; kt += uint(TILE_K)) {
-        if (tid < uint(TILE_M)) {
-            uint r = row0 + tid;
-            if (r < m) {
-                load_a_row(a_batch + r * stride_01, kt, tid);
-            } else {
-                for (uint z = 0u; z < uint(TILE_K); z++) {
-                    Atile[z][tid] = 0.0;
+#if defined(KSPLIT)
+#if !defined(MMID)
+    uint dst_base0 = offset_dst + dst3_idx * (m * n * batches2) + dst2_idx * (m * n);
+    if (k_begin != 0u && wg_ok) {
+        for (uint im0 = 0u; im0 < uint(REG_M); im0++) {
+            uint r = row0 + ty * uint(REG_M) + im0;
+            for (uint in0 = 0u; in0 < uint(REG_N); in0++) {
+                uint c = col0 + tx * uint(REG_N) + in0;
+                if (r < m && c < n) {
+                    acc[im0][in0] = LOAD_F32(dst, dst_base0 + c * m + r);
                 }
             }
         }
-        for (uint i = 0u; i < 4u; i++) {
-            uint ki = b_part * 4u + i;
-            Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0;
-        }
-        memoryBarrierShared();
-        barrier();
-
-        for (uint kk = 0u; kk < uint(TILE_K); kk++) {
-            float a[REG_M];
-            float b[REG_N];
-            for (uint im2 = 0u; im2 < uint(REG_M); im2++) {
-                a[im2] = Atile[kk][ty * uint(REG_M) + im2];
-            }
-            for (uint in2 = 0u; in2 < uint(REG_N); in2++) {
-                b[in2] = Btile[kk][tx * uint(REG_N) + in2];
-            }
-            for (uint im3 = 0u; im3 < uint(REG_M); im3++) {
-                for (uint in3 = 0u; in3 < uint(REG_N); in3++) {
-                    acc[im3][in3] += a[im3] * b[in3];
-                }
-            }
-        }
-        memoryBarrierShared();
-        barrier();
     }
+#endif
+    k_step(k_begin, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+#if K_STEPS > 1
+    k_step(k_begin + 32u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+#endif
+#if K_STEPS > 2
+    k_step(k_begin + 64u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+    k_step(k_begin + 96u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+#endif
+#if K_STEPS > 4
+    k_step(k_begin + 128u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+    k_step(k_begin + 160u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+    k_step(k_begin + 192u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+    k_step(k_begin + 224u, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+#endif
+#else
+    for (uint kt = 0u; kt < k; kt += uint(TILE_K)) {
+        k_step(kt, tid, tx, ty, row0, a_batch, b_ok, b_base, b_part, b_col);
+    }
+#endif
 
     if (!wg_ok) {
         return;
