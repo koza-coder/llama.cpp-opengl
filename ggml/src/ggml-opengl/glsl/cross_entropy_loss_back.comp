@@ -1,0 +1,75 @@
+#include "common.glsl"
+
+// Port of the D3D12 cross_entropy_loss_back.hlsl (tools/hlsl2glsl/port.py + hand fixes).
+
+// CROSS_ENTROPY_LOSS_BACK (f32), one workgroup per row. src[0] is the scalar gradient of the
+// loss, src[1] the forward logits, src[2] the forward labels. Following
+// ggml_compute_forward_cross_entropy_loss_back_f32:
+//   dst = (softmax(logits) - labels) * grad[0] / n_rows
+// Everything but the scalar gradient is contiguous and the same shape as dst.
+
+layout(std430, binding = 0) buffer Buf0 { uint grad_buf[]; };
+layout(std430, binding = 1) buffer Buf1 { uint s0_buf[]; };
+layout(std430, binding = 2) buffer Buf2 { uint s1_buf[]; };
+layout(std430, binding = 3) buffer Buf3 { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_grad;
+    uint offset_s0;
+    uint offset_s1;
+    uint offset_dst;
+    uint ne0;
+    uint n_rows;
+    uint nwg_x;
+};
+
+shared float scratch[WG_SIZE];
+
+layout(local_size_x = WG_SIZE) in;
+
+void main() {
+    const uvec3 gtid = gl_LocalInvocationID;
+    const uvec3 gid = gl_WorkGroupID;
+    const uint row = gid.y * nwg_x + gid.x;
+    if (row >= n_rows) {
+        return;
+    }
+    const uint t    = gtid.x;
+    const uint base = row * ne0;
+
+    float m = -3.0e38;
+    for (uint c0 = t; c0 < ne0; c0 += WG_SIZE) {
+        m = max(m, LOAD_F32(s0_buf, offset_s0 + base + c0));
+    }
+    scratch[t] = m;
+    barrier();
+    for (uint o1 = WG_SIZE / 2; o1 > 0; o1 /= 2) {
+        if (t < o1) {
+            scratch[t] = max(scratch[t], scratch[t + o1]);
+        }
+        barrier();
+    }
+    const float row_max = scratch[0];
+    barrier();
+
+    float se = 0.0;
+    for (uint c1 = t; c1 < ne0; c1 += WG_SIZE) {
+        se += exp(LOAD_F32(s0_buf, offset_s0 + base + c1) - row_max);
+    }
+    scratch[t] = se;
+    barrier();
+    for (uint o2 = WG_SIZE / 2; o2 > 0; o2 /= 2) {
+        if (t < o2) {
+            scratch[t] += scratch[t + o2];
+        }
+        barrier();
+    }
+    const float inv_sum = 1.0 / scratch[0];
+
+    const float d_by_nr = LOAD_F32(grad_buf, offset_grad) / float(n_rows);
+
+    for (uint c2 = t; c2 < ne0; c2 += WG_SIZE) {
+        const float p = exp(LOAD_F32(s0_buf, offset_s0 + base + c2) - row_max) * inv_sum;
+        STORE_F32(dst, offset_dst + base + c2, (p - LOAD_F32(s1_buf, offset_s1 + base + c2)) * d_by_nr);
+    }
+}

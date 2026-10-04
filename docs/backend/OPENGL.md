@@ -10,13 +10,13 @@ driver offers an OpenGL 4.3 (or newer) core context, including GPUs without Vulk
 
 ## Status
 
-Tested with release v0.0.6:
+Tested with release v0.0.7:
 
 | GPU | Result |
 |---|---|
-| AMD Radeon AI PRO R9700 | every exe in the zip runs; new ops SSM_SCAN, GROUP_NORM, ADD_ID, CONV_2D_DW pass; qwen2.5-0.5b q4_0 PPL 17.29, pp512 7068 / tg64 113 tok/s; SmolVLM-500M (image) correct |
-| Intel Iris Xe | new ops SSM_SCAN, GROUP_NORM, ADD_ID, CONV_2D_DW pass |
-| Moore Threads MTT S80 | not tested with v0.0.6 (offline); v0.0.5: qwen2.5-0.5b q4_0 PPL 17.29, pp512 788 / tg64 31 tok/s |
+| AMD Radeon AI PRO R9700 | every exe in the zip runs; the 40 new ops and MUL_MAT 5687/5687 in `test-backend-ops`; qwen2.5-0.5b q4_0 PPL 17.29, pp512 7018 / tg64 116 tok/s; SmolVLM-500M (image) correct |
+| Intel Iris Xe | every exe in the zip runs; qwen2.5-0.5b q4_0 PPL 17.29, pp512 328 / tg64 6.8 tok/s; SmolVLM-500M (image) correct |
+| Moore Threads MTT S80 | not tested since v0.0.5 (offline); v0.0.5: qwen2.5-0.5b q4_0 PPL 17.29, pp512 788 / tg64 31 tok/s |
 
 Ops the backend does not support run on the CPU (the ggml scheduler does this automatically). The authoritative list
 of supported ops and types is `ggml_backend_opengl_device_supports_op` in `ggml-opengl.cpp`.

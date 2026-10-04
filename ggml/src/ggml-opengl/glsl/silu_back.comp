@@ -1,0 +1,33 @@
+#include "common.glsl"
+
+// Port of the D3D12 silu_back.hlsl (tools/hlsl2glsl/port.py + hand fixes).
+
+// SILU_BACK (f32): dst = dy * s * (1 + x*(1 - s)) with s = sigmoid(x), following
+// ggml_silu_backward_f32. src[0] is the incoming gradient dy, src[1] is the forward input x.
+// Elementwise: one thread each.
+
+layout(std430, binding = 0) buffer Buf0 { uint dy_buf[]; };
+layout(std430, binding = 1) buffer Buf1 { uint x_buf[]; };
+layout(std430, binding = 2) buffer Buf2 { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_dy;
+    uint offset_x;
+    uint offset_dst;
+    uint ne;
+    uint nwg_x;
+};
+
+layout(local_size_x = WG_SIZE) in;
+
+void main() {
+    const uvec3 gid = gl_GlobalInvocationID;
+    const uint i = flat_index(gid, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+    const float x  = LOAD_F32(x_buf, offset_x + i);
+    const float dy = LOAD_F32(dy_buf, offset_dy + i);
+    const float s  = 1.0 / (1.0 + exp(-x));
+    STORE_F32(dst, offset_dst + i, dy * s * (1.0 + x * (1.0 - s)));
+}
