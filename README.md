@@ -88,6 +88,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 | [MUSA](docs/build.md#musa) | Moore Threads GPU |
 | [Metal](docs/build.md#metal-build) | Apple Silicon |
 | [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
+| [OpenGL](docs/backend/OPENGL.md) | GPU with OpenGL 4.3 (Windows) |
 | [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
 | [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
 | [SYCL](docs/backend/SYCL.md) | Intel GPU |

@@ -1244,6 +1244,124 @@ static void ggml_opengl_ssm_conv(gl_device_ctx & dev, ggml_tensor * src0, ggml_t
     ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
 
+// GROUP_NORM (f32), port of the D3D12 path: one workgroup per (group, i03)
+static void ggml_opengl_group_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "group_norm", glsl_group_norm, {});
+
+    const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t n_channels = (uint32_t) src->ne[2];
+    const uint32_t n_groups   = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t n_batches  = (uint32_t) src->ne[3];
+    float eps;
+    memcpy(&eps, (const int32_t *) dst->op_params + 1, sizeof(float));
+
+    std::vector<uint32_t> params = {
+        bs.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
+        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        n_channels, n_groups, CEIL_DIV(n_channels, n_groups), n_batches,
+        ggml_opengl_u32_from_f32(eps),
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, n_groups * n_batches);
+}
+
+// ADD_ID (f32), port of the D3D12 path: dst[i0, i1, i2] = src0[i0, i1, i2] + src1[i0, ids[i1, i2]]
+static void ggml_opengl_add_id(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * ids,
+                               ggml_tensor * dst) {
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "add_id", glsl_add_id, {});
+
+    const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
+    const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
+    const gl_binding bi = ggml_opengl_bind_tensor(dev, ids);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+    const uint32_t   ne = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, bi.elem_offset, bd.elem_offset,
+        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src1->nb[1] / 4),
+        (uint32_t) (ids->nb[1] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4),
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], ne,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bi, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+// SSM_SCAN, port of the D3D12 path: one thread per (sequence, head, dim); the token loop stays inside the thread
+static void ggml_opengl_ssm_scan(gl_device_ctx & dev, ggml_tensor * dst) {
+    ggml_tensor * s0  = dst->src[0];
+    ggml_tensor * x   = dst->src[1];
+    ggml_tensor * dt  = dst->src[2];
+    ggml_tensor * A   = dst->src[3];
+    ggml_tensor * B   = dst->src[4];
+    ggml_tensor * C   = dst->src[5];
+    ggml_tensor * ids = dst->src[6];
+
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "ssm_scan", glsl_ssm_scan, {});
+
+    const gl_binding b0 = ggml_opengl_bind_tensor(dev, s0);
+    const gl_binding b1 = ggml_opengl_bind_tensor(dev, x);
+    const gl_binding b2 = ggml_opengl_bind_tensor(dev, dt);
+    const gl_binding b3 = ggml_opengl_bind_tensor(dev, A);
+    const gl_binding b4 = ggml_opengl_bind_tensor(dev, B);
+    const gl_binding b5 = ggml_opengl_bind_tensor(dev, C);
+    const gl_binding b6 = ggml_opengl_bind_tensor(dev, ids);
+    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
+
+    const uint32_t nc     = (uint32_t) s0->ne[0];
+    const uint32_t nr     = (uint32_t) s0->ne[1];
+    const uint32_t nh     = (uint32_t) x->ne[1];
+    const uint32_t ng     = (uint32_t) B->ne[1];
+    const uint32_t nt     = (uint32_t) x->ne[2];
+    const uint32_t ns     = (uint32_t) x->ne[3];
+    const uint32_t n_jobs = ns * nh * nr;
+
+    std::vector<uint32_t> params = {
+        b0.elem_offset, b1.elem_offset, b2.elem_offset, b3.elem_offset,
+        b4.elem_offset, b5.elem_offset, b6.elem_offset, bd.elem_offset,
+        (uint32_t) (s0->nb[3] / 4),
+        (uint32_t) (x->nb[2] / 4), (uint32_t) (x->nb[3] / 4),
+        (uint32_t) (dt->nb[1] / 4), (uint32_t) (dt->nb[2] / 4),
+        (uint32_t) (B->nb[2] / 4), (uint32_t) (B->nb[3] / 4),
+        (uint32_t) (C->nb[2] / 4), (uint32_t) (C->nb[3] / 4),
+        nc, nr, nh, ng, nt, ns,
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_nelements(x),          // s_off, in elements
+        (uint32_t) (A->ne[0] == 1 ? 1 : 0),    // Mamba-2 has a scalar decay per head
+        n_jobs,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, b2, b3, b4, b5, b6, bd },
+                         CEIL_DIV(n_jobs, (uint32_t) GGML_GL_WG_SIZE));
+}
+
+// CONV_2D_DW (WHCN, f32 or f16 kernel), port of the D3D12 path: one thread per destination element
+static void ggml_opengl_conv_2d_dw(gl_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<std::string> defines;
+    if (knl->type == GGML_TYPE_F16) {
+        defines = { "KNL_F16" };
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
+                                                      glsl_conv_2d_dw, defines);
+
+    const gl_binding bk   = ggml_opengl_bind_tensor(dev, knl);
+    const gl_binding bs   = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bd   = ggml_opengl_bind_tensor(dev, dst);
+    const int32_t *  opts = (const int32_t *) dst->op_params;
+    const uint32_t   ne   = (uint32_t) ggml_nelements(dst);
+
+    std::vector<uint32_t> params = {
+        bk.elem_offset, bs.elem_offset, bd.elem_offset,
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1],
+        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
+        (uint32_t) knl->ne[0], (uint32_t) knl->ne[1],
+        (uint32_t) src->ne[2],
+        (uint32_t) opts[0], (uint32_t) opts[1], (uint32_t) opts[2],
+        (uint32_t) opts[3], (uint32_t) opts[4], (uint32_t) opts[5],
+        ne,
+    };
+    ggml_opengl_dispatch(dev, pipeline, params, { bk, bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
+}
+
 static bool ggml_opengl_unary_supported(ggml_unary_op op) {
     switch (op) {
         case GGML_UNARY_OP_ABS: case GGML_UNARY_OP_SGN: case GGML_UNARY_OP_NEG: case GGML_UNARY_OP_STEP:
@@ -2105,6 +2223,18 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_SSM_CONV:
             ggml_opengl_ssm_conv(dev, node->src[0], node->src[1], node);
             return;
+        case GGML_OP_GROUP_NORM:
+            ggml_opengl_group_norm(dev, node->src[0], node);
+            return;
+        case GGML_OP_ADD_ID:
+            ggml_opengl_add_id(dev, node->src[0], node->src[1], node->src[2], node);
+            return;
+        case GGML_OP_CONV_2D_DW:
+            ggml_opengl_conv_2d_dw(dev, node->src[0], node->src[1], node);
+            return;
+        case GGML_OP_SSM_SCAN:
+            ggml_opengl_ssm_scan(dev, node);
+            return;
         case GGML_OP_GLU:
             ggml_opengl_glu(dev, node->src[0], node->src[1], node);
             return;
@@ -2677,6 +2807,40 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 return op->type == GGML_TYPE_F32 && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
                        (pool == GGML_OP_POOL_AVG || pool == GGML_OP_POOL_MAX) && ggml_is_contiguous(op) &&
                        src0->nb[0] == ggml_type_size(src0->type);
+            }
+        case GGML_OP_GROUP_NORM:
+            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) && ggml_are_same_shape(src0, op);
+        case GGML_OP_ADD_ID:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) && ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_CONV_2D_DW:
+            // only the WHCN path; the CWHN variant the CPU also handles has a different kernel layout
+            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                   (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
+                   ggml_nelements(op) <= UINT32_MAX;
+        case GGML_OP_SSM_SCAN:
+            {
+                // one thread per (sequence, head, dim); the rows it indexes directly must be packed
+                const ggml_tensor * dt  = op->src[2];
+                const ggml_tensor * A   = op->src[3];
+                const ggml_tensor * B   = op->src[4];
+                const ggml_tensor * C   = op->src[5];
+                const ggml_tensor * ids = op->src[6];
+                const int64_t nc = src0->ne[0];
+                const int64_t nr = src0->ne[1];
+                const int64_t nh = src1->ne[1];
+                const int64_t ng = B->ne[1];
+                bool ok = op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                          dt->type == GGML_TYPE_F32 && A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32 &&
+                          C->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32;
+                ok = ok && ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dt->nb[0] == sizeof(float) &&
+                     src1->nb[1] == nr * sizeof(float) && A->nb[1] == A->ne[0] * sizeof(float) &&
+                     B->nb[1] == nc * sizeof(float) && C->nb[1] == nc * sizeof(float);
+                // every stride is passed in float units, and the flat job index is 32 bit
+                ok = ok && ng != 0 && nh % ng == 0 && ggml_nelements(op) <= UINT32_MAX;
+                return ok;
             }
         case GGML_OP_SSM_CONV:
             // same layout requirements as the CPU kernel
