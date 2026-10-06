@@ -1,6 +1,6 @@
 #include "common.glsl"
 
-// Port of the D3D11 cpy.hlsl. defines: SRC_{F32,F16,I32}, DST_{F32,F16,I32}
+// Port of the D3D11 cpy.hlsl. defines: SRC_{F32,F16,BF16,I32}, DST_{F32,F16,BF16,I32}
 
 #if defined(SRC_F32)
 #define SRC_T float
@@ -8,6 +8,9 @@
 #elif defined(SRC_F16)
 #define SRC_T float
 #define LOAD_SRC(i) LOAD_F16(src, i)
+#elif defined(SRC_BF16)
+#define SRC_T float
+#define LOAD_SRC(i) uintBitsToFloat(((src[(i) >> 1] >> (((i) & 1u) * 16u)) & 0xFFFFu) << 16)
 #elif defined(SRC_I32)
 #define SRC_T int
 #define LOAD_SRC(i) LOAD_I32(src, i)
@@ -19,6 +22,23 @@
 #elif defined(DST_F16)
 #define DST_T float
 #define STORE_DST(i, v) STORE_F16(dst, i, v)
+#elif defined(DST_BF16)
+#define DST_T float
+// f32 -> bf16 as the CPU does (ggml_compute_fp32_to_bf16): NaN stays a quiet NaN, else round to nearest even;
+// the half is written with two atomics as STORE_F16 does
+uint f32_to_bf16(float f) {
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (u >> 16) | 64u;
+    }
+    return (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;
+}
+#define STORE_DST(i, v) { \
+    uint _h  = f32_to_bf16(v); \
+    uint _sh = ((i) & 1u) * 16u; \
+    atomicAnd(dst[(i) >> 1], ~(0xFFFFu << _sh)); \
+    atomicOr(dst[(i) >> 1], _h << _sh); \
+}
 #elif defined(DST_I32)
 #define DST_T int
 #define STORE_DST(i, v) STORE_I32(dst, i, v)

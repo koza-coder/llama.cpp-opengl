@@ -1120,11 +1120,21 @@ const uint KSIGNS[128] = uint[](
     0x00000078u, 0x000000f9u, 0x000000fau, 0x0000007bu, 0x000000fcu, 0x0000007du, 0x0000007eu, 0x000000ffu
 );
 #endif
-#if defined(SRC0_MXFP4)
+#if defined(SRC0_MXFP4) || defined(SRC0_NVFP4)
 const float KVALUES_MXFP4[16] = float[](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
 
 // e8m0 scale, halved to match the doubled e2m1 table (ggml_e8m0_to_fp32_half)
 float e8m0_to_f32_half(uint e) {
     return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
+}
+
+// ue4m3 scale (4 exponent bits, bias 7, 3 mantissa bits), halved like ggml_ue4m3_to_fp32; 0 and 0x7F give 0
+float ue4m3_to_f32_half(uint x) {
+    if (x == 0u || x == 0x7Fu) {
+        return 0.0;
+    }
+    uint e = (x >> 3) & 0xFu;
+    uint m = x & 7u;
+    return e == 0u ? ldexp(float(m), -10) : ldexp(1.0 + float(m) / 8.0, int(e) - 8);
 }
 #endif

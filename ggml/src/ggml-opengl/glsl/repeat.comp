@@ -1,6 +1,7 @@
 #include "common.glsl"
 
-// Port of the D3D11 repeat.hlsl. REPEAT (f32): dst[i0, i1, i2, i3] = src[i0 % ne00, i1 % ne01, i2 % ne02, i3 % ne03], any strides
+// Port of the D3D11 repeat.hlsl. REPEAT: dst[i0, i1, i2, i3] = src[i0 % ne00, i1 % ne01, i2 % ne02, i3 % ne03], any strides.
+// 32-bit elements are copied as words; ELEM16 (f16, bf16, i16): strides in halves, the half written with two atomics
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -42,5 +43,13 @@ void main() {
     const uint i0 = i % ne0;
     const uint s = offset_src + (i0 % src_ne0) * stride_src0 + (i1 % src_ne1) * stride_src1 +
                    (i2 % src_ne2) * stride_src2 + (i3 % src_ne3) * stride_src3;
-    dst[offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3] = src[s];
+    const uint d = offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
+#if defined(ELEM16)
+    const uint bits = (src[s >> 1] >> ((s & 1u) * 16u)) & 0xFFFFu;
+    const uint sh   = (d & 1u) * 16u;
+    atomicAnd(dst[d >> 1], ~(0xFFFFu << sh));
+    atomicOr(dst[d >> 1], bits << sh);
+#else
+    dst[d] = src[s];
+#endif
 }

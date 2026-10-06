@@ -459,6 +459,26 @@ void load_a_row(uint row_base, uint k0, uint col) {
             }
         }
     }
+#elif defined(SRC0_NVFP4)
+    // block of 64 (36 bytes, word aligned): four ue4m3 scales, 8 nibble bytes per sub-block of 16; a tile of 32
+    // is half a block, sub-blocks 2h and 2h + 1
+    {
+        uint blk  = k0 / 64u;
+        uint base = (row_base + blk) * 9u;   // in words
+        uint sc   = src0[base];
+        for (uint t = 0u; t < 2u; t++) {
+            uint  s = ((k0 / 32u) & 1u) * 2u + t;
+            float d = ue4m3_to_f32_half(BYTE_OF(sc, s));
+            for (uint j = 0u; j < 2u; j++) {
+                uint q = src0[base + 1u + 2u * s + j];
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byte_v = BYTE_OF(q, b);
+                    Atile[blk * 64u + s * 16u + j * 4u + b - k0][col] = KVALUES_MXFP4[byte_v & 0xFu] * d;
+                    Atile[blk * 64u + s * 16u + 8u + j * 4u + b - k0][col] = KVALUES_MXFP4[byte_v >> 4] * d;
+                }
+            }
+        }
+    }
 #elif defined(SRC0_TQ2_0)
     // super-block of 256 (66 bytes): 64 bytes qs, f16 d. Value h * 128 + l * 32 + m is bits 2l..2l+1 of
     // qs[h * 32 + m], minus 1, times d. Sub-block s (of 8) = half h = s / 4, shift l = s % 4.

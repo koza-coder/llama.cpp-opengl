@@ -32,6 +32,7 @@ layout(std140, binding = 0) uniform Params {
 
     float eps;
     uint  offset_w;
+    uint  stride_src0;   // src nb[0] / 4 (rows may be strided, e.g. a permuted view)
 
     uint nwg_x;
 };
@@ -70,7 +71,7 @@ void main() {
 #if defined(SUM_ROWS) || defined(MEAN) || defined(NORM)
     float sum = 0.0;
     for (uint col = tid; col < ne0; col += uint(WG_SIZE)) {
-        sum += LOAD_F32(src, src_row + col);
+        sum += LOAD_F32(src, src_row + col * stride_src0);
     }
     sum = wg_sum(sum);
 #endif
@@ -90,7 +91,7 @@ void main() {
 #endif
     float sum2 = 0.0;
     for (uint col = tid; col < ne0; col += uint(WG_SIZE)) {
-        float v = LOAD_F32(src, src_row + col) - mean;
+        float v = LOAD_F32(src, src_row + col * stride_src0) - mean;
         sum2 += v * v;
     }
     sum2 = wg_sum(sum2);
@@ -103,11 +104,11 @@ void main() {
     for (uint c = tid; c < ne0; c += uint(WG_SIZE)) {
 #if defined(MUL_W)
         // two roundings as in the unfused RMS_NORM then MUL; precise keeps the compiler from contracting them
-        precise float y = (LOAD_F32(src, src_row + c) - mean) * scale;
+        precise float y = (LOAD_F32(src, src_row + c * stride_src0) - mean) * scale;
         y = y * LOAD_F32(w, offset_w + c);
         STORE_F32(dst, dst_row + c, y);
 #else
-        STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c) - mean) * scale);
+        STORE_F32(dst, dst_row + c, (LOAD_F32(src, src_row + c * stride_src0) - mean) * scale);
 #endif
     }
 #endif
