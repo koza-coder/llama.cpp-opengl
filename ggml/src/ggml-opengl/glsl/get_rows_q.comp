@@ -3,6 +3,7 @@
 // GET_ROWS for quantized src, after the D3D11 get_rows_q.hlsl: dst[i1, i2, i3] = dequantize(src[idx[i1, i2, i3], i2, i3]),
 // idx is i32, dst f32. TPR threads share one row. The dequant paths are copied from mul_mat_vec.comp with ACC storing
 // the value instead of accumulating a dot product. src offsets and strides are in blocks. defines: SRC0_<TYPE>, TPR
+// CPYQ: used by CPY quantized -> f32: row = i1 (idx buffer unused), ne1/ne2 = src ne1/ne2
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -57,7 +58,11 @@ void main() {
     uint i2 = r / ne1;
     uint i1 = r % ne1;
 
+#ifdef CPYQ
+    uint row       = i1;
+#else
     uint row       = uint(LOAD_I32(idx, offset_idx + i1 * stride_idx0 + i2 * stride_idx1 + i3 * stride_idx2));
+#endif
     uint dst_base  = offset_dst + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
     uint src0_base = offset_src + row * stride_src1 + i2 * stride_src2 + i3 * stride_src3;
 
@@ -334,6 +339,39 @@ void main() {
                     ACC(KVALUES_MXFP4[byte_v & 0xFu] * d, (u / 2u) * 64u + s * 16u + j * 4u + b);
                     ACC(KVALUES_MXFP4[byte_v >> 4] * d, (u / 2u) * 64u + s * 16u + 8u + j * 4u + b);
                 }
+            }
+        }
+    }
+#elif defined(SRC0_TQ1_0)
+    // block of 256 (54 bytes): qs[48] (5 digits per byte), qh[4] (4 digits per byte), f16 d.
+    // 14 units per block: t 0-4 = digit n of qs bytes 0-31 (values n*32 + m); t 5-9 = digit n of qs bytes 32-47
+    // (values 160 + n*16 + m); t 10-13 = digit n of qh (values 240 + n*4 + j). Digit = ((byte * 3^n) & 255) * 3 >> 8, minus 1.
+    const uint POW3_TQ1[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+    for (uint sb = lane; sb < (k / 256u) * 14u; sb += uint(TPR)) {
+        uint blk  = sb / 14u;
+        uint t    = sb % 14u;
+        uint base = (src0_base + blk) * 54u;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 52u, dbits);
+        float d = f16_to_f32(dbits);
+        if (t < 10u) {
+            uint n     = t % 5u;
+            uint boff  = t < 5u ? 0u : 32u;
+            uint cnt   = t < 5u ? 8u : 4u;
+            uint vbase = t < 5u ? n * 32u : 160u + n * 16u;
+            for (uint w = 0u; w < cnt; w++) {
+                uint q;
+                LOAD_U32_UNALIGNED(src0, base + boff + 4u * w, q);
+                for (uint b = 0u; b < 4u; b++) {
+                    ACC((float((((BYTE_OF(q, b) * POW3_TQ1[n]) & 0xFFu) * 3u) >> 8) - 1.0) * d, blk * 256u + vbase + w * 4u + b);
+                }
+            }
+        } else {
+            uint n = t - 10u;
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + 48u, q);
+            for (uint b = 0u; b < 4u; b++) {
+                ACC((float((((BYTE_OF(q, b) * POW3_TQ1[n]) & 0xFFu) * 3u) >> 8) - 1.0) * d, blk * 256u + 240u + n * 4u + b);
             }
         }
     }

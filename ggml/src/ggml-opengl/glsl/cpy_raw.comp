@@ -1,0 +1,89 @@
+#include "common.glsl"
+
+// Port of the D3D12 cpy_raw.hlsl (tools/hlsl2glsl/port.py + hand fixes).
+
+// CPY / DUP / CONT of one type to itself, copied as raw bits; any strides, src and dst may differ in shape.
+// TS = bytes per element (a quantised block counts as one element, ne0 and the strides are in blocks).
+// CH4: TS % 4 == 0, words; CH2: TS % 2 == 0, halves; CH1: bytes. Halves and bytes are written with two atomics so the
+// neighbouring elements are kept.
+
+layout(std430, binding = 0) buffer Buf0 { uint src[]; };
+layout(std430, binding = 1) buffer Buf1 { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint ne;
+    uint offset_src;
+    uint offset_dst;
+
+    uint stride_src0;
+    uint stride_src1;
+    uint stride_src2;
+    uint stride_src3;
+
+    uint stride_dst0;
+    uint stride_dst1;
+    uint stride_dst2;
+    uint stride_dst3;
+
+    uint src_ne0;
+    uint src_ne1;
+    uint src_ne2;
+
+    uint dst_ne0;
+    uint dst_ne1;
+    uint dst_ne2;
+
+    uint nwg_x;
+};
+
+layout(local_size_x = WG_SIZE) in;
+
+void main() {
+    const uvec3 gid = gl_GlobalInvocationID;
+    const uint idx = flat_index(gid, nwg_x);
+    if (idx >= ne) {
+        return;
+    }
+
+    uint i = idx;
+    const uint i3 = i / (src_ne2 * src_ne1 * src_ne0);
+    i = i % (src_ne2 * src_ne1 * src_ne0);
+    const uint i2 = i / (src_ne1 * src_ne0);
+    i = i % (src_ne1 * src_ne0);
+    const uint i1 = i / src_ne0;
+    const uint i0 = i % src_ne0;
+
+    uint j = idx;
+    const uint j3 = j / (dst_ne2 * dst_ne1 * dst_ne0);
+    j = j % (dst_ne2 * dst_ne1 * dst_ne0);
+    const uint j2 = j / (dst_ne1 * dst_ne0);
+    j = j % (dst_ne1 * dst_ne0);
+    const uint j1 = j / dst_ne0;
+    const uint j0 = j % dst_ne0;
+
+    const uint sb = (offset_src + i0 * stride_src0 + i1 * stride_src1 + i2 * stride_src2 + i3 * stride_src3) * TS;
+    const uint db = (offset_dst + j0 * stride_dst0 + j1 * stride_dst1 + j2 * stride_dst2 + j3 * stride_dst3) * TS;
+#if defined(CH4)
+    for (uint o = 0; o < TS; o += 4) {
+        dst[(db + o) >> 2] = src[(sb + o) >> 2];
+    }
+#elif defined(CH2)
+    for (uint o = 0; o < TS; o += 2) {
+        uint v;
+        LOAD_U16_UNALIGNED(src, sb + o, v);
+        const uint a  = db + o;
+        const uint sh = (a & 2u) * 8u;
+        atomicAnd(dst[a >> 2], ~(0xFFFFu << sh));
+        atomicOr(dst[a >> 2], v << sh);
+    }
+#else
+    for (uint o = 0; o < TS; o++) {
+        const uint a  = sb + o;
+        const uint v  = (src[a >> 2] >> ((a & 3u) * 8u)) & 0xFFu;
+        const uint d  = db + o;
+        const uint sh = (d & 3u) * 8u;
+        atomicAnd(dst[d >> 2], ~(0xFFu << sh));
+        atomicOr(dst[d >> 2], v << sh);
+    }
+#endif
+}

@@ -1,29 +1,47 @@
 #include "common.glsl"
 
-// SET_ROWS f32 -> q4_0 / q4_1 / q5_0 / q5_1 / q8_0 (port of the D3D12 set_rows_q8.hlsl, more block types):
-// dst[idx[row]] = quantize(src[row]), one thread per source row, quantized as the CPU reference does
-// (quantize_row_*_ref). Blocks are 18..34 bytes, so rows do not start on word boundaries; a row writes its bytes
-// word by word and keeps the neighbour bytes of its first and last word. Rows whose global dst row numbers have
-// the other parity run in a second dispatch, so two threads never touch the same word. dst is contiguous;
-// offsets and strides are in blocks. defines: DST_Q4_0, DST_Q4_1, DST_Q5_0, DST_Q5_1 or DST_Q8_0; I64_IDX
+// Port of the D3D12 set_rows_q.hlsl (tools/hlsl2glsl/port.py + hand fixes).
 
-#if defined(DST_Q4_0)
-#define BLOCK_BYTES 18u
-#elif defined(DST_Q4_1)
-#define BLOCK_BYTES 20u
-#elif defined(DST_Q5_0)
-#define BLOCK_BYTES 22u
-#elif defined(DST_Q5_1)
-#define BLOCK_BYTES 24u
-#else
-#define BLOCK_BYTES 34u
+// SET_ROWS f32/f16 -> quantized (and CPY, with IDENT): dst[idx[row]] = quantize(src[row]), one thread per source row.
+// Blocks are 18-34 bytes (f16 scale first), so rows do not start on word boundaries; a row writes its bytes word by word and keeps
+// the neighbour bytes of its first and last word. Rows whose global dst row numbers have the other parity run in
+// a second dispatch, so two threads never touch the same word. dst is contiguous; offsets and strides are in
+// blocks. defines: QT_{Q8_0,Q4_0,Q4_1,Q5_0,Q5_1,IQ4_NL,Q1_0,Q2_0}, SRC_F16 (needs USE_16BIT), I64_IDX,
+// IDENT (row = i_src1, idx unused: CPY)
+// every quantizer follows quantize_row_*_ref of ggml-quants.c
+
+#if defined(QT_Q8_0)
+#define QK 32u
+#define TS 34u
+#elif defined(QT_Q4_0) || defined(QT_IQ4_NL)
+#define QK 32u
+#define TS 18u
+#elif defined(QT_Q4_1)
+#define QK 32u
+#define TS 20u
+#elif defined(QT_Q5_0)
+#define QK 32u
+#define TS 22u
+#elif defined(QT_Q5_1)
+#define QK 32u
+#define TS 24u
+#elif defined(QT_Q1_0)
+#define QK 128u
+#define TS 18u
+#elif defined(QT_Q2_0)
+#define QK 64u
+#define TS 18u
 #endif
 
-layout(local_size_x = WG_SIZE) in;
+#ifdef SRC_F16
+#define LOAD_SRC(i) LOAD_F16(src, i)
+#else
+#define LOAD_SRC(i) LOAD_F32(src, i)
+#endif
 
-layout(std430, binding = 0) buffer Src { uint src[]; };
-layout(std430, binding = 1) buffer Idx { uint idx[]; };
-layout(std430, binding = 2) buffer Dst { uint dst[]; };
+layout(std430, binding = 0) buffer Buf0 { uint src[]; };
+layout(std430, binding = 1) buffer Buf1 { uint idx[]; };
+layout(std430, binding = 2) buffer Buf2 { uint dst[]; };
 
 layout(std140, binding = 0) uniform Params {
     uint offset_src;
@@ -55,148 +73,241 @@ layout(std140, binding = 0) uniform Params {
 };
 
 uint g_word;
-uint g_pos;
-uint g_end;
+uint g_blk[TS];   // the bytes of the block being built
 
-// append one byte to the row
-void put_byte(uint b) {
-    if ((g_pos & 3u) == 0u) {
+float rnd(float x) {
+    return sign(x) * floor(abs(x) + 0.5);   // roundf: halves away from zero
+}
+
+void put16(uint o, uint h) {
+    g_blk[o]     = h & 0xFFu;
+    g_blk[o + 1] = (h >> 8) & 0xFFu;
+}
+
+#ifdef QT_IQ4_NL
+const int kvalues[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+int best_index_int8(float x) {
+    if (x <= float(kvalues[0])) return 0;
+    if (x >= float(kvalues[15])) return 15;
+    int ml = 0, mu = 15;
+    while (mu - ml > 1) {
+        const int mav = (ml + mu) / 2;
+        if (x < float(kvalues[mav])) mu = mav; else ml = mav;
+    }
+    return x - float(kvalues[mu - 1]) < float(kvalues[mu]) - x ? mu - 1 : mu;
+}
+#endif
+
+void quant_block(uint s) {
+    float v[QK];
+    for (uint j = 0; j < QK; j++) {
+        v[j] = LOAD_SRC(s + j);
+    }
+    for (uint z = 0; z < TS; z++) {
+        g_blk[z] = 0;
+    }
+#if defined(QT_Q8_0)
+    float amax = 0.0;
+    for (uint j = 0; j < 32u; j++) {
+        amax = max(amax, abs(v[j]));
+    }
+    const float d  = amax / 127.0;
+    const float id = d != 0.0 ? 1.0 / d : 0.0;
+    put16(0, f32_to_f16_rne(d));
+    for (uint j2 = 0; j2 < 32u; j2++) {
+        g_blk[2 + j2] = uint(int(rnd(v[j2] * id))) & 0xFFu;
+    }
+#elif defined(QT_Q4_0) || defined(QT_Q5_0)
+    float amax = 0.0;
+    float mx   = 0.0;
+    for (uint j = 0; j < 32u; j++) {
+        if (amax < abs(v[j])) {
+            amax = abs(v[j]);
+            mx   = v[j];
+        }
+    }
+#ifdef QT_Q4_0
+    const float d = mx / -8.0;
+#else
+    const float d = mx / -16.0;
+#endif
+    const float id = d != 0.0 ? 1.0 / d : 0.0;
+    put16(0, f32_to_f16_rne(d));
+#ifdef QT_Q4_0
+    for (uint j = 0; j < 16u; j++) {
+        precise float t0 = v[j] * id + 8.5;
+        precise float t1 = v[16u + j] * id + 8.5;
+        const uint xi0 = uint(min(15, int(t0)));
+        const uint xi1 = uint(min(15, int(t1)));
+        g_blk[2 + j] = xi0 | (xi1 << 4);
+    }
+#else
+    uint qh = 0;
+    for (uint j = 0; j < 16u; j++) {
+        precise float t0 = v[j] * id + 16.5;
+        precise float t1 = v[16u + j] * id + 16.5;
+        const uint xi0 = uint(min(31, int(t0)));
+        const uint xi1 = uint(min(31, int(t1)));
+        g_blk[6 + j] = (xi0 & 0xFu) | ((xi1 & 0xFu) << 4);
+        qh |= ((xi0 & 0x10u) >> 4) << j;
+        qh |= ((xi1 & 0x10u) >> 4) << (j + 16u);
+    }
+    for (uint k = 0; k < 4u; k++) {
+        g_blk[2 + k] = (qh >> (8u * k)) & 0xFFu;
+    }
+#endif
+#elif defined(QT_Q4_1) || defined(QT_Q5_1)
+    float mn = 3.402823466e+38;
+    float mx = -3.402823466e+38;
+    for (uint j = 0; j < 32u; j++) {
+        if (v[j] < mn) mn = v[j];
+        if (v[j] > mx) mx = v[j];
+    }
+#ifdef QT_Q4_1
+    const float d = (mx - mn) / 15.0;
+#else
+    const float d = (mx - mn) / 31.0;
+#endif
+    const float id = d != 0.0 ? 1.0 / d : 0.0;
+    put16(0, f32_to_f16_rne(d));
+    put16(2, f32_to_f16_rne(mn));
+#ifdef QT_Q4_1
+    for (uint j = 0; j < 16u; j++) {
+        precise float t0 = (v[j] - mn) * id + 0.5;
+        precise float t1 = (v[16u + j] - mn) * id + 0.5;
+        const uint xi0 = uint(min(15, int(t0)));
+        const uint xi1 = uint(min(15, int(t1)));
+        g_blk[4 + j] = xi0 | (xi1 << 4);
+    }
+#else
+    uint qh = 0;
+    for (uint j = 0; j < 16u; j++) {
+        precise float t0 = (v[j] - mn) * id + 0.5;
+        precise float t1 = (v[16u + j] - mn) * id + 0.5;
+        const uint xi0 = uint(t0) & 0xFFu;
+        const uint xi1 = uint(t1) & 0xFFu;
+        g_blk[8 + j] = (xi0 & 0xFu) | ((xi1 & 0xFu) << 4);
+        qh |= ((xi0 & 0x10u) >> 4) << j;
+        qh |= ((xi1 & 0x10u) >> 4) << (j + 16u);
+    }
+    for (uint k = 0; k < 4u; k++) {
+        g_blk[4 + k] = (qh >> (8u * k)) & 0xFFu;
+    }
+#endif
+#elif defined(QT_IQ4_NL)
+    float amax = 0.0;
+    float mx   = 0.0;
+    for (uint j = 0; j < 32u; j++) {
+        if (abs(v[j]) > amax) {
+            amax = abs(v[j]);
+            mx   = v[j];
+        }
+    }
+    float d = 0.0;
+    uint  L[32];
+    for (uint j2 = 0; j2 < 32u; j2++) {
+        L[j2] = 0;
+    }
+    if (amax >= 1e-15) {
+        const float id0 = 1.0 / (mx / float(kvalues[0]));
+        float sumqx = 0.0;
+        float sumq2 = 0.0;
+        for (uint j3 = 0; j3 < 32u; j3++) {
+            const int   l = best_index_int8(id0 * v[j3]);
+            const float q = float(kvalues[l]);
+            precise float w = v[j3] * v[j3];
+            L[j3] = uint(l);
+            precise float aqx = w * q * v[j3];
+            precise float aq2 = w * q * q;
+            sumqx += aqx;
+            sumq2 += aq2;
+        }
+        d = sumq2 > 0.0 ? sumqx / sumq2 : 0.0;
+    }
+    put16(0, f32_to_f16_rne(d));
+    for (uint j4 = 0; j4 < 16u; j4++) {
+        g_blk[2 + j4] = L[j4] | (L[16u + j4] << 4);
+    }
+#elif defined(QT_Q1_0)
+    float sum_abs = 0.0;
+    for (uint j = 0; j < 128u; j++) {
+        sum_abs += abs(v[j]);
+    }
+    put16(0, f32_to_f16_rne(sum_abs / 128.0));
+    for (uint j2 = 0; j2 < 128u; j2++) {
+        if (v[j2] >= 0.0) {
+            g_blk[2 + j2 / 8u] |= 1u << (j2 % 8u);
+        }
+    }
+#elif defined(QT_Q2_0)
+    float amax = 0.0;
+    for (uint j = 0; j < 64u; j++) {
+        amax = max(amax, abs(v[j]));
+    }
+    const float id = amax > 0.0 ? 1.0 / amax : 0.0;
+    put16(0, f32_to_f16_rne(amax));
+    for (uint j2 = 0; j2 < 64u; j2++) {
+        const int q = clamp(int(rnd(v[j2] * id)) + 1, 0, 3);
+        g_blk[2 + j2 / 4u] |= (uint(q)) << ((j2 % 4u) * 2u);
+    }
+#endif
+}
+
+// write one byte at absolute byte address pos of a row that ends at byte end
+void put_byte(uint pos, uint end, uint b) {
+    if ((pos & 3u) == 0u) {
         // a word that the row does not fill to the end keeps the neighbour's high bytes
-        g_word = g_pos + 4u > g_end ? dst[g_pos >> 2] : 0u;
+        g_word = pos + 4u > end ? dst[pos >> 2] : 0u;
     }
-    uint sh = (g_pos & 3u) * 8u;
+    const uint sh = (pos & 3u) * 8u;
     g_word = (g_word & ~(0xFFu << sh)) | ((b & 0xFFu) << sh);
-    if ((g_pos & 3u) == 3u || g_pos + 1u == g_end) {
-        dst[g_pos >> 2] = g_word;
+    if ((pos & 3u) == 3u || pos + 1u == end) {
+        dst[(pos & ~3u) >> 2] = g_word;
     }
-    g_pos++;
 }
 
-void put_u16(uint v) {
-    put_byte(v);
-    put_byte(v >> 8);
-}
+layout(local_size_x = WG_SIZE) in;
 
 void main() {
-    uint row = flat_index(gl_GlobalInvocationID, nwg_x);
+    const uvec3 gid = gl_GlobalInvocationID;
+    uint row = flat_index(gid, nwg_x);
     if (row >= ne3 * ne2 * n_rows) {
         return;
     }
-    uint i_src3 = row / (ne2 * n_rows);
+    const uint i_src3 = row / (ne2 * n_rows);
     row = row % (ne2 * n_rows);
-    uint i_src2 = row / n_rows;
-    uint i_src1 = row % n_rows;
+    const uint i_src2 = row / n_rows;
+    const uint i_src1 = row % n_rows;
 
-    uint idx_elem = offset_idx + i_src1 * stride_idx0 + (i_src2 % idx1) * stride_idx1 + (i_src3 % idx2) * stride_idx2;
-#ifdef I64_IDX
-    uint idx_val = idx[idx_elem * 2u];
+#ifdef IDENT
+    const uint idx_val = i_src1;
 #else
-    uint idx_val = idx[idx_elem];
+    const uint idx_elem = offset_idx + i_src1 * stride_idx0 + (i_src2 % idx1) * stride_idx1 + (i_src3 % idx2) * stride_idx2;
+#ifdef I64_IDX
+    const uint idx_val = idx[(idx_elem * 8) >> 2];
+#else
+    const uint idx_val = idx[(idx_elem * 4) >> 2];
 #endif
-    uint grow = (i_src3 * dst_ne2 + i_src2) * dst_ne1 + idx_val;   // dst row number in the contiguous tensor
+#endif
+    const uint grow = (i_src3 * dst_ne2 + i_src2) * dst_ne1 + idx_val;   // dst row number in the contiguous tensor
     if ((grow & 1u) != parity) {
         return;
     }
 
-    uint i_src_row = offset_src + i_src1 * stride_src1 + i_src2 * stride_src2 + i_src3 * stride_src3;
-    uint base      = (offset_dst + grow * stride_dst1) * BLOCK_BYTES;
-    uint n_blocks  = ne0 / 32u;
-    g_end = base + n_blocks * BLOCK_BYTES;
-    g_pos = base;
+    const uint i_src_row = offset_src + i_src1 * stride_src1 + i_src2 * stride_src2 + i_src3 * stride_src3;
+    const uint base      = (offset_dst + grow * stride_dst1) * TS;
+    const uint n_blocks  = ne0 / QK;
+    const uint end       = base + n_blocks * TS;
 
     // the first word may start before the row: keep the neighbour's low bytes
-    g_word = dst[base >> 2];
-    for (uint b = 0u; b < n_blocks; b++) {
-        uint x0 = i_src_row + b * 32u;
-#if defined(DST_Q8_0)
-        float amax = 0.0;
-        for (uint j = 0u; j < 32u; j++) {
-            amax = max(amax, abs(LOAD_F32(src, x0 + j)));
+    g_word = dst[(base & ~3u) >> 2];
+    uint pos = base;
+    for (uint b = 0; b < n_blocks; b++) {
+        quant_block(i_src_row + b * QK);
+        for (uint z = 0; z < TS; z++) {
+            put_byte(pos, end, g_blk[z]);
+            pos++;
         }
-        float d  = amax / 127.0;
-        float id = d != 0.0 ? 1.0 / d : 0.0;
-        put_u16(f32_to_f16_rne(d));
-        for (uint j = 0u; j < 32u; j++) {
-            float x = LOAD_F32(src, x0 + j) * id;
-            put_byte(uint(int(sign(x) * floor(abs(x) + 0.5))));   // roundf: halves away from zero
-        }
-#elif defined(DST_Q4_0) || defined(DST_Q5_0)
-        // the element of largest magnitude, with its sign
-        float amax = 0.0;
-        float vmax = 0.0;
-        for (uint j = 0u; j < 32u; j++) {
-            float v = LOAD_F32(src, x0 + j);
-            if (amax < abs(v)) {
-                amax = abs(v);
-                vmax = v;
-            }
-        }
-#if defined(DST_Q4_0)
-        float d  = vmax / -8.0;
-#else
-        float d  = vmax / -16.0;
-#endif
-        float id = d != 0.0 ? 1.0 / d : 0.0;
-        put_u16(f32_to_f16_rne(d));
-#if defined(DST_Q5_0)
-        uint qh = 0u;
-        for (uint j = 0u; j < 16u; j++) {
-            uint q0 = uint(min(31, int(LOAD_F32(src, x0 + j) * id + 16.5)));
-            uint q1 = uint(min(31, int(LOAD_F32(src, x0 + j + 16u) * id + 16.5)));
-            qh |= ((q0 & 0x10u) >> 4) << j;
-            qh |= ((q1 & 0x10u) >> 4) << (j + 16u);
-        }
-        put_u16(qh);
-        put_u16(qh >> 16);
-#endif
-        for (uint j = 0u; j < 16u; j++) {
-#if defined(DST_Q4_0)
-            uint q0 = uint(min(15, int(LOAD_F32(src, x0 + j) * id + 8.5)));
-            uint q1 = uint(min(15, int(LOAD_F32(src, x0 + j + 16u) * id + 8.5)));
-#else
-            uint q0 = uint(min(31, int(LOAD_F32(src, x0 + j) * id + 16.5)));
-            uint q1 = uint(min(31, int(LOAD_F32(src, x0 + j + 16u) * id + 16.5)));
-#endif
-            put_byte((q0 & 0xFu) | ((q1 & 0xFu) << 4));
-        }
-#else
-        // q4_1 / q5_1: min and range
-        float vmin = 3.4028235e38;
-        float vmax = -3.4028235e38;
-        for (uint j = 0u; j < 32u; j++) {
-            float v = LOAD_F32(src, x0 + j);
-            vmin = min(vmin, v);
-            vmax = max(vmax, v);
-        }
-#if defined(DST_Q4_1)
-        float d  = (vmax - vmin) / 15.0;
-#else
-        float d  = (vmax - vmin) / 31.0;
-#endif
-        float id = d != 0.0 ? 1.0 / d : 0.0;
-        put_u16(f32_to_f16_rne(d));
-        put_u16(f32_to_f16_rne(vmin));
-#if defined(DST_Q5_1)
-        uint qh = 0u;
-        for (uint j = 0u; j < 16u; j++) {
-            uint q0 = uint(int((LOAD_F32(src, x0 + j) - vmin) * id + 0.5));
-            uint q1 = uint(int((LOAD_F32(src, x0 + j + 16u) - vmin) * id + 0.5));
-            qh |= ((q0 & 0x10u) >> 4) << j;
-            qh |= ((q1 & 0x10u) >> 4) << (j + 16u);
-        }
-        put_u16(qh);
-        put_u16(qh >> 16);
-#endif
-        for (uint j = 0u; j < 16u; j++) {
-#if defined(DST_Q4_1)
-            uint q0 = uint(min(15, int((LOAD_F32(src, x0 + j) - vmin) * id + 0.5)));
-            uint q1 = uint(min(15, int((LOAD_F32(src, x0 + j + 16u) - vmin) * id + 0.5)));
-#else
-            uint q0 = uint(int((LOAD_F32(src, x0 + j) - vmin) * id + 0.5));
-            uint q1 = uint(int((LOAD_F32(src, x0 + j + 16u) - vmin) * id + 0.5));
-#endif
-            put_byte((q0 & 0xFu) | ((q1 & 0xFu) << 4));
-        }
-#endif
     }
 }

@@ -1,10 +1,25 @@
 #include "common.glsl"
 
 // Port of the D3D11 set_rows.hlsl: dst[idx[row]] = src[row]; src is f32, or f16 with SRC_F16.
-// defines: DST_{F32,F16}, SRC_F16, I64_IDX (the low 32 bits of each index are used)
+// defines: DST_{F32,F16,BF16}, SRC_F16 (f32 -> bf16: round to nearest even, a NaN stays a NaN), I64_IDX (the low 32 bits of each index are used)
 
 #if defined(DST_F16)
 #define STORE_DST(i, v) STORE_F16(dst, i, v)
+#elif defined(DST_BF16)
+uint f32_to_bf16_bits(float f) {
+    const uint x = floatBitsToUint(f);
+    if ((x & 0x7FFFFFFFu) > 0x7F800000u) {
+        return (x >> 16) | 0x40u;
+    }
+    return (x + 0x7FFFu + ((x >> 16) & 1u)) >> 16;
+}
+// no 16-bit stores: write the half with two atomics so the neighbouring element is kept
+#define STORE_DST(i, v) { \
+    const uint _b  = f32_to_bf16_bits(v); \
+    const uint _sh = (((i) * 2u) & 2u) * 8u; \
+    atomicAnd(dst[((i) * 2u) >> 2], ~(0xFFFFu << _sh)); \
+    atomicOr(dst[((i) * 2u) >> 2], _b << _sh); \
+}
 #else
 #define STORE_DST(i, v) STORE_F32(dst, i, v)
 #endif

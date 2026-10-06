@@ -1,8 +1,9 @@
 #include "common.glsl"
 
 // Port of the D3D11 concat.hlsl. CONCAT of two 4-byte tensors (f32 or i32, copied as raw bits) along dim; any strides
-// ELEM16: 2-byte elements (f16) instead; strides and offsets are then in halves, the dst half is written with two
-// atomics so the other half of its word is kept
+// ELEM16: 2-byte elements (f16, bf16, i16), ELEM8: 1-byte (i8), ELEM64: 8-byte (i64): strides and offsets are then in
+// units of the element size; a half or byte is written with two atomics so its neighbours are kept; 8-byte elements move as
+// two words. ELEMBLK=<bytes>: quantised blocks (even size), one element is one block, ne0 etc. count blocks; copied as halves
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -53,27 +54,45 @@ void main() {
     idx[0] = i % ne0;
 
     const uint i_dst = offset_dst + idx[0] * stride_dst0 + idx[1] * stride_dst1 + idx[2] * stride_dst2 + idx[3] * stride_dst3;
+    const bool from0 = idx[dim] < src0_nedim;
+    uint j;
+    if (from0) {
+        j = offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03;
+    } else {
+        idx[dim] -= src0_nedim;
+        j = offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13;
+    }
 #if defined(ELEM16)
     uint bits;
-    if (idx[dim] < src0_nedim) {
-        uint j = offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03;
-        bits = (src0[j >> 1] >> ((j & 1u) * 16u)) & 0xFFFFu;
+    if (from0) { LOAD_U16_UNALIGNED(src0, j * 2u, bits); } else { LOAD_U16_UNALIGNED(src1, j * 2u, bits); }
+    const uint sh = ((i_dst * 2u) & 2u) * 8u;
+    atomicAnd(dst[(i_dst * 2u) >> 2], ~(0xFFFFu << sh));
+    atomicOr(dst[(i_dst * 2u) >> 2], bits << sh);
+#elif defined(ELEM8)
+    const uint w    = from0 ? src0[j >> 2] : src1[j >> 2];
+    const uint bits = (w >> ((j & 3u) * 8u)) & 0xFFu;
+    const uint sh   = (i_dst & 3u) * 8u;
+    atomicAnd(dst[i_dst >> 2], ~(0xFFu << sh));
+    atomicOr(dst[i_dst >> 2], bits << sh);
+#elif defined(ELEM64)
+    if (from0) {
+        dst[i_dst * 2u]      = src0[j * 2u];
+        dst[i_dst * 2u + 1u] = src0[j * 2u + 1u];
     } else {
-        idx[dim] -= src0_nedim;
-        uint j = offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13;
-        bits = (src1[j >> 1] >> ((j & 1u) * 16u)) & 0xFFFFu;
+        dst[i_dst * 2u]      = src1[j * 2u];
+        dst[i_dst * 2u + 1u] = src1[j * 2u + 1u];
     }
-    uint sh = (i_dst & 1u) * 16u;
-    atomicAnd(dst[i_dst >> 1], ~(0xFFFFu << sh));
-    atomicOr(dst[i_dst >> 1], bits << sh);
+#elif defined(ELEMBLK)
+    for (uint h = 0u; h < uint(ELEMBLK) / 2u; h++) {
+        uint v;
+        const uint a = j * uint(ELEMBLK) + h * 2u;
+        if (from0) { LOAD_U16_UNALIGNED(src0, a, v); } else { LOAD_U16_UNALIGNED(src1, a, v); }
+        const uint da = i_dst * uint(ELEMBLK) + h * 2u;
+        const uint sh = (da & 2u) * 8u;
+        atomicAnd(dst[da >> 2], ~(0xFFFFu << sh));
+        atomicOr(dst[da >> 2], v << sh);
+    }
 #else
-    uint bits;
-    if (idx[dim] < src0_nedim) {
-        bits = src0[offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03];
-    } else {
-        idx[dim] -= src0_nedim;
-        bits = src1[offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13];
-    }
-    dst[i_dst] = bits;
+    dst[i_dst] = from0 ? src0[j] : src1[j];
 #endif
 }

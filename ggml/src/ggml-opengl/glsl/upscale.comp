@@ -1,7 +1,7 @@
 #include "common.glsl"
 
-// Port of the D3D12 upscale.hlsl. UPSCALE (f32), nearest or bilinear (with or without align corners), following
-// the CPU reference; one thread per dst element, any strides. defines: BILINEAR
+// Port of the D3D12 upscale.hlsl. UPSCALE (f32), nearest, bilinear or bicubic (alpha -0.75, with or without align
+// corners), following the CPU reference; one thread per dst element, any strides. defines: BILINEAR or BICUBIC
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -33,6 +33,12 @@ layout(std140, binding = 0) uniform Params {
     uint  nwg_x;
 };
 
+float cubic_w1(float x) { return ((-0.75 + 2.0) * x - (-0.75 + 3.0)) * x * x + 1.0; }
+float cubic_w2(float x) { return ((-0.75 * x + 3.75) * x - 6.0) * x + 3.0; }
+float cubic(float p0, float p1, float p2, float p3, float x) {
+    return p0 * cubic_w2(x + 1.0) + p1 * cubic_w1(x) + p2 * cubic_w1(1.0 - x) + p3 * cubic_w2(2.0 - x);
+}
+
 void main() {
     uint i = flat_index(gl_GlobalInvocationID, nwg_x);
     if (i >= ne) {
@@ -50,7 +56,25 @@ void main() {
     const uint base = offset_src + i02 * stride_src2 + i03 * stride_src3;
     const uint o    = offset_dst + i0 * stride_dst0 + i1 * stride_dst1 + i2 * stride_dst2 + i3 * stride_dst3;
 
-#if defined(BILINEAR)
+#if defined(BICUBIC)
+    const float y  = (float(i1) + pixel_offset) / sf1 - pixel_offset;
+    const int   y0 = int(floor(y));
+    const float dy = y - float(y0);
+    const float x  = (float(i0) + pixel_offset) / sf0 - pixel_offset;
+    const int   x0 = int(floor(x));
+    const float dx = x - float(x0);
+    float rows[4];
+    for (int r = 0; r < 4; r++) {
+        const uint yy = uint(clamp(y0 + r - 1, 0, int(src_ne1) - 1));
+        float p[4];
+        for (int c = 0; c < 4; c++) {
+            const uint xx = uint(clamp(x0 + c - 1, 0, int(src_ne0) - 1));
+            p[c] = LOAD_F32(src, base + xx * stride_src0 + yy * stride_src1);
+        }
+        rows[r] = cubic(p[0], p[1], p[2], p[3], dx);
+    }
+    STORE_F32(dst, o, cubic(rows[0], rows[1], rows[2], rows[3], dy));
+#elif defined(BILINEAR)
     const float y  = (float(i1) + pixel_offset) / sf1 - pixel_offset;
     const int   fy = int(floor(y));
     const int   y0 = clamp(fy, 0, int(src_ne1) - 1);
