@@ -318,6 +318,25 @@ void main() {
             }
         }
     }
+#elif defined(SRC0_NVFP4)
+    // block of 64 (36 bytes, word aligned): four ue4m3 scale bytes, then 32 bytes of nibbles indexing the
+    // e2m1 table, 8 per sub-block of 16 (low nibbles first half, high nibbles second). One unit = 32 values.
+    for (uint u = lane; u < k / 32u; u += uint(TPR)) {
+        uint base = (src0_base + u / 2u) * 9u;   // in words
+        uint sc   = src0[base];
+        for (uint t = 0u; t < 2u; t++) {
+            uint  s = (u & 1u) * 2u + t;
+            float d = ue4m3_to_f32_half(BYTE_OF(sc, s));
+            for (uint j = 0u; j < 2u; j++) {
+                uint q = src0[base + 1u + 2u * s + j];
+                for (uint b = 0u; b < 4u; b++) {
+                    uint byte_v = BYTE_OF(q, b);
+                    ACC(KVALUES_MXFP4[byte_v & 0xFu] * d, (u / 2u) * 64u + s * 16u + j * 4u + b);
+                    ACC(KVALUES_MXFP4[byte_v >> 4] * d, (u / 2u) * 64u + s * 16u + 8u + j * 4u + b);
+                }
+            }
+        }
+    }
 #elif defined(SRC0_TQ2_0)
     // super-block of 256 (66 bytes): 64 bytes qs, f16 d. Value h * 128 + l * 32 + m is bits 2l..2l+1 of
     // qs[h * 32 + m], minus 1, times d. Sub-block s (of 8) = half h = s / 4, shift l = s % 4.

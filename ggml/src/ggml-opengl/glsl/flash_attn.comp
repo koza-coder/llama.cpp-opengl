@@ -8,7 +8,8 @@
 //   pass 2 (COMBINE): one thread per output row merges its blocks (and the sink) into dst
 // Output row = i3 * n_q * n_head + i1 * n_head + i2; a dispatch covers rows row0 .. row0 + n_rows - 1 and t is
 // the row index inside that range.
-// defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32 or K_Q8_0, V_F16, V_F32 or V_Q8_0,
+// defines: DK, DV (head sizes, multiples of 4), K_F16, K_F32, K_BF16 or K_<Q> and V_F16, V_F32, V_BF16 or V_<Q>
+//          (<Q> = Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL; quantized K/V need head sizes that are multiples of 32),
 //          HAS_MASK (f16 mask), HAS_SINKS, SOFTCAP, COMBINE, MQ4 (pass 1 with 4 query rows per workgroup)
 
 layout(local_size_x = WG_SIZE) in;
@@ -68,6 +69,17 @@ layout(std140, binding = 0) uniform Params {
 
 #define NEG_INF_SCORE -3.4028235e38
 
+#if defined(K_Q8_0) || defined(K_Q4_0) || defined(K_Q4_1) || defined(K_Q5_0) || defined(K_Q5_1) || defined(K_IQ4_NL)
+#define K_QUANT
+#endif
+#if defined(V_Q8_0) || defined(V_Q4_0) || defined(V_Q4_1) || defined(V_Q5_0) || defined(V_Q5_1) || defined(V_IQ4_NL)
+#define V_QUANT
+#endif
+#if defined(K_IQ4_NL) || defined(V_IQ4_NL)
+#define SRC0_IQ4_NL   // quant_tables.glsl defines KVALUES_IQ4NL only for this
+#include "quant_tables.glsl"
+#endif
+
 #if !defined(COMBINE)
 // f16 element i (element index) of an SSBO
 #define F16_AT(buf, i) f16_to_f32((buf)[(i) >> 1] >> (((i) & 1u) * 16u))
@@ -87,10 +99,75 @@ layout(std140, binding = 0) uniform Params {
                                     bitfieldExtract(int(_w), 16, 8), bitfieldExtract(int(_w), 24, 8)); \
 }
 
+// the other 32-element block types; e = index in the block (a multiple of 4), the 4 elements share one qs word:
+// elements 0..15 are the low nibbles of qs[e..e+3], 16..31 the high nibbles of qs[e-16..e-13]
+#define NIBBLES_4(buf, qs_byte, e, out) { \
+    uint _q; \
+    LOAD_U32_UNALIGNED(buf, (qs_byte) + ((e) & 15u), _q); \
+    _q = (e) >= 16u ? (_q >> 4) : _q; \
+    out = uvec4(_q & 0xFu, (_q >> 8) & 0xFu, (_q >> 16) & 0xFu, (_q >> 24) & 0xFu); \
+}
+#define HIGH_BITS_4(qh, e) (uvec4((qh) >> (e), (qh) >> ((e) + 1u), (qh) >> ((e) + 2u), (qh) >> ((e) + 3u)) & 1u) * 16u
+#define LOAD_Q4_0_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 18u; \
+    uint _dbits; \
+    uvec4 _n; \
+    LOAD_U16_UNALIGNED(buf, _byte, _dbits); \
+    NIBBLES_4(buf, _byte + 2u, (i) % 32u, _n); \
+    out = f16_to_f32(_dbits) * (vec4(_n) - 8.0); \
+}
+#define LOAD_Q4_1_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 20u; \
+    uint _w; \
+    uvec4 _n; \
+    LOAD_U32_UNALIGNED(buf, _byte, _w); \
+    NIBBLES_4(buf, _byte + 4u, (i) % 32u, _n); \
+    out = f16_to_f32(_w) * vec4(_n) + f16_to_f32(_w >> 16); \
+}
+#define LOAD_Q5_0_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 22u; \
+    uint _dbits, _qh; \
+    uvec4 _n; \
+    LOAD_U16_UNALIGNED(buf, _byte, _dbits); \
+    LOAD_U32_UNALIGNED(buf, _byte + 2u, _qh); \
+    NIBBLES_4(buf, _byte + 6u, (i) % 32u, _n); \
+    out = f16_to_f32(_dbits) * (vec4(_n + HIGH_BITS_4(_qh, (i) % 32u)) - 16.0); \
+}
+#define LOAD_Q5_1_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 24u; \
+    uint _w, _qh; \
+    uvec4 _n; \
+    LOAD_U32_UNALIGNED(buf, _byte, _w); \
+    LOAD_U32_UNALIGNED(buf, _byte + 4u, _qh); \
+    NIBBLES_4(buf, _byte + 8u, (i) % 32u, _n); \
+    out = f16_to_f32(_w) * vec4(_n + HIGH_BITS_4(_qh, (i) % 32u)) + f16_to_f32(_w >> 16); \
+}
+#define LOAD_IQ4_NL_4(buf, i, out) { \
+    uint _byte = ((i) / 32u) * 18u; \
+    uint _dbits; \
+    uvec4 _n; \
+    LOAD_U16_UNALIGNED(buf, _byte, _dbits); \
+    NIBBLES_4(buf, _byte + 2u, (i) % 32u, _n); \
+    out = f16_to_f32(_dbits) * vec4(KVALUES_IQ4NL[_n.x], KVALUES_IQ4NL[_n.y], KVALUES_IQ4NL[_n.z], KVALUES_IQ4NL[_n.w]); \
+}
+#define BF16_AT(buf, i) uintBitsToFloat((((buf)[(i) >> 1] >> (((i) & 1u) * 16u)) & 0xFFFFu) << 16)
+
 vec4 load_k4(uint i) {
     vec4 r;
 #if defined(K_Q8_0)
     LOAD_Q8_0_4(k_buf, i, r);
+#elif defined(K_Q4_0)
+    LOAD_Q4_0_4(k_buf, i, r);
+#elif defined(K_Q4_1)
+    LOAD_Q4_1_4(k_buf, i, r);
+#elif defined(K_Q5_0)
+    LOAD_Q5_0_4(k_buf, i, r);
+#elif defined(K_Q5_1)
+    LOAD_Q5_1_4(k_buf, i, r);
+#elif defined(K_IQ4_NL)
+    LOAD_IQ4_NL_4(k_buf, i, r);
+#elif defined(K_BF16)
+    r = vec4(BF16_AT(k_buf, i), BF16_AT(k_buf, i + 1u), BF16_AT(k_buf, i + 2u), BF16_AT(k_buf, i + 3u));
 #elif defined(K_F16)
     r = vec4(F16_AT(k_buf, i), F16_AT(k_buf, i + 1u), F16_AT(k_buf, i + 2u), F16_AT(k_buf, i + 3u));
 #else
@@ -103,6 +180,18 @@ vec4 load_v4(uint i) {
     vec4 r;
 #if defined(V_Q8_0)
     LOAD_Q8_0_4(v_buf, i, r);
+#elif defined(V_Q4_0)
+    LOAD_Q4_0_4(v_buf, i, r);
+#elif defined(V_Q4_1)
+    LOAD_Q4_1_4(v_buf, i, r);
+#elif defined(V_Q5_0)
+    LOAD_Q5_0_4(v_buf, i, r);
+#elif defined(V_Q5_1)
+    LOAD_Q5_1_4(v_buf, i, r);
+#elif defined(V_IQ4_NL)
+    LOAD_IQ4_NL_4(v_buf, i, r);
+#elif defined(V_BF16)
+    r = vec4(BF16_AT(v_buf, i), BF16_AT(v_buf, i + 1u), BF16_AT(v_buf, i + 2u), BF16_AT(v_buf, i + 3u));
 #elif defined(V_F16)
     r = vec4(F16_AT(v_buf, i), F16_AT(v_buf, i + 1u), F16_AT(v_buf, i + 2u), F16_AT(v_buf, i + 3u));
 #else
@@ -214,7 +303,7 @@ void main() {
         }
 #endif
         if (any(visible)) {
-#if defined(K_Q8_0)
+#if defined(K_QUANT)
             uint kj = (k_base + j * stride_k1) * 32u;
 #else
             uint kj = k_base + j * stride_k1;
@@ -300,7 +389,7 @@ void main() {
         for (uint jj = gr; jj < jn; jj += G) {
             vec4 pj = p_sh[jj];
             if (any(notEqual(pj, vec4(0.0)))) {
-#if defined(V_Q8_0)
+#if defined(V_QUANT)
                 uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
 #else
                 uint vj = v_base + (b * blk_size + jj) * stride_v1;
@@ -384,7 +473,7 @@ void main() {
         mv = slope * f16_to_f32(mbits);
 #endif
         if (visible) {
-#if defined(K_Q8_0)
+#if defined(K_QUANT)
             uint kj = (k_base + j * stride_k1) * 32u;
 #else
             uint kj = k_base + j * stride_k1;
@@ -454,7 +543,7 @@ void main() {
         for (uint jj = g; jj < jn; jj += G) {
             float pj = p_sh[jj];
             if (pj != 0.0) {
-#if defined(V_Q8_0)
+#if defined(V_QUANT)
                 uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
 #else
                 uint vj = v_base + (b * blk_size + jj) * stride_v1;
@@ -484,7 +573,7 @@ void main() {
         for (uint jj = 0u; jj < jn; jj++) {
             float pj = p_sh[jj];
             if (pj != 0.0) {
-#if defined(V_Q8_0)
+#if defined(V_QUANT)
                 uint vj = (v_base + (b * blk_size + jj) * stride_v1) * 32u;
 #else
                 uint vj = v_base + (b * blk_size + jj) * stride_v1;

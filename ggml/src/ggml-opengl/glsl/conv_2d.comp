@@ -12,8 +12,8 @@
 // same way here; accumulation stays f32.
 // defines: KNL_F16 (with USE_16BIT)
 
-layout(std430, binding = 0) buffer Buf0 { uint knl[]; };   // src0 {KW, KH, IC, OC}, contiguous
-layout(std430, binding = 1) buffer Buf1 { uint src[]; };   // src1 {W, H, C, N}
+layout(std430, binding = 0) buffer Buf0 { uint knl[]; };   // src0 {KW, KH, IC, OC}, any strides (CWHN too)
+layout(std430, binding = 1) buffer Buf1 { uint src[]; };   // src1 {W, H, C, N}, any strides
 layout(std430, binding = 2) buffer Buf2 { uint dst[]; };   // dst  {OW, OH, OC, N}
 
 layout(std140, binding = 0) uniform Params {
@@ -41,6 +41,11 @@ layout(std140, binding = 0) uniform Params {
     int  dilation_x;
     int  dilation_y;
     uint ne;
+    uint stride_s0;   // src1 nb[0] / 4
+    uint stride_k0;   // src0 nb[] in kernel elements
+    uint stride_k1;
+    uint stride_k2;
+    uint stride_k3;
     uint nwg_x;
 };
 
@@ -67,8 +72,7 @@ void main() {
     const uint oy = rem / ne0;
     const uint ox = rem % ne0;
 
-    const uint plane    = knl_h * knl_w;
-    const uint knl_base = offset_knl + oc * c_in * plane;
+    const uint knl_base = offset_knl + oc * stride_k3;
     const uint src_base = offset_src + n * stride_s3;
 
     float sum = 0.0;
@@ -82,10 +86,10 @@ void main() {
             if (sx < 0 || sx >= int(src_w)) {
                 continue;
             }
-            const uint s_pos = src_base + uint(sy) * stride_s1 + uint(sx);
-            const uint k_pos = knl_base + ky * knl_w + kx;
+            const uint s_pos = src_base + uint(sy) * stride_s1 + uint(sx) * stride_s0;
+            const uint k_pos = knl_base + ky * stride_k1 + kx * stride_k0;
             for (uint ic = 0; ic < c_in; ic++) {
-                sum += SRC_ROUND(LOAD_F32(src, s_pos + ic * stride_s2)) * LOAD_KNL(k_pos + ic * plane);
+                sum += SRC_ROUND(LOAD_F32(src, s_pos + ic * stride_s2)) * LOAD_KNL(k_pos + ic * stride_k2);
             }
         }
     }

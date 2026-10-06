@@ -994,6 +994,7 @@ static std::string ggml_opengl_type_define(ggml_type type, const char * prefix) 
         case GGML_TYPE_IQ1_S: s += "_IQ1_S"; break;
         case GGML_TYPE_IQ1_M: s += "_IQ1_M"; break;
         case GGML_TYPE_MXFP4: s += "_MXFP4"; break;
+        case GGML_TYPE_NVFP4: s += "_NVFP4"; break;
         case GGML_TYPE_TQ2_0: s += "_TQ2_0"; break;
         case GGML_TYPE_Q1_0: s += "_Q1_0"; break;
         case GGML_TYPE_Q2_0: s += "_Q2_0"; break;
@@ -1556,8 +1557,9 @@ static void ggml_opengl_conv_2d(gl_device_ctx & dev, ggml_tensor * knl, ggml_ten
     const gl_binding bk = ggml_opengl_bind_tensor(dev, knl);
     const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
-    const int32_t * op = (const int32_t *) dst->op_params;
-    const uint32_t  ne = (uint32_t) ggml_nelements(dst);
+    const int32_t * op  = (const int32_t *) dst->op_params;
+    const uint32_t  ne  = (uint32_t) ggml_nelements(dst);
+    const size_t    kts = ggml_type_size(knl->type);
     std::vector<uint32_t> params = {
         bk.elem_offset, bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
@@ -1566,7 +1568,8 @@ static void ggml_opengl_conv_2d(gl_device_ctx & dev, ggml_tensor * knl, ggml_ten
         (uint32_t) src->ne[2],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
         (uint32_t) op[0], (uint32_t) op[1], (uint32_t) op[2], (uint32_t) op[3], (uint32_t) op[4], (uint32_t) op[5],
-        ne,
+        ne, (uint32_t) (src->nb[0] / 4),
+        (uint32_t) (knl->nb[0] / kts), (uint32_t) (knl->nb[1] / kts), (uint32_t) (knl->nb[2] / kts), (uint32_t) (knl->nb[3] / kts),
     };
     ggml_opengl_dispatch(dev, pipeline, params, { bk, bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
@@ -2116,7 +2119,8 @@ static void ggml_opengl_unary(gl_device_ctx & dev, ggml_tensor * src, ggml_tenso
 }
 
 static void ggml_opengl_repeat(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "repeat", glsl_repeat, {});
+    const size_t  ts       = ggml_type_size(dst->type);
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "repeat", glsl_repeat, { ts == 2 ? "ELEM16" : "ELEM32" });
 
     const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
@@ -2124,8 +2128,8 @@ static void ggml_opengl_repeat(gl_device_ctx & dev, ggml_tensor * src, ggml_tens
 
     std::vector<uint32_t> params = {
         bs.elem_offset, bd.elem_offset,
-        (uint32_t) (src->nb[0] / 4), (uint32_t) (src->nb[1] / 4), (uint32_t) (src->nb[2] / 4), (uint32_t) (src->nb[3] / 4),
-        (uint32_t) (dst->nb[0] / 4), (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
+        (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
+        (uint32_t) (dst->nb[0] / ts), (uint32_t) (dst->nb[1] / ts), (uint32_t) (dst->nb[2] / ts), (uint32_t) (dst->nb[3] / ts),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], ne,
     };
@@ -2303,7 +2307,7 @@ static void ggml_opengl_rms_norm(gl_device_ctx & dev, ggml_tensor * src, ggml_te
         (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], n_rows,
         ggml_opengl_u32_from_f32(ggml_get_op_params_f32(norm, 0)),   // eps
-        bw.elem_offset,
+        bw.elem_offset, (uint32_t) (src->nb[0] / 4),
     };
     // one workgroup per row
     if (w) {
@@ -2342,8 +2346,43 @@ static void ggml_opengl_glu(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor
     ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
 
+// f32 rows quantized into a q4_0 / q4_1 / q5_0 / q5_1 / q8_0 dst (quantized KV cache); two dispatches by dst row
+// parity, so no two threads write the same word (set_rows_q.comp)
+static void ggml_opengl_set_rows_q(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
+    std::vector<std::string> defines = { ggml_opengl_type_define(dst->type, "DST") };
+    if (idx->type == GGML_TYPE_I64) {
+        defines.push_back("I64_IDX");
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "set_rows_q", glsl_set_rows_q, defines);
+
+    const gl_binding bs     = ggml_opengl_bind_tensor(dev, src);
+    const gl_binding bi     = ggml_opengl_bind_tensor(dev, idx);
+    const gl_binding bd     = ggml_opengl_bind_tensor(dev, dst);
+    const size_t     ts     = ggml_type_size(src->type);
+    const size_t     ti     = ggml_type_size(idx->type);
+    const size_t     td     = ggml_type_size(dst->type);
+    const uint32_t   n_rows = (uint32_t) (src->ne[1] * src->ne[2] * src->ne[3]);
+
+    std::vector<uint32_t> params = {
+        bs.elem_offset, bi.elem_offset, bd.elem_offset,
+        (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
+        (uint32_t) (idx->nb[0] / ti), (uint32_t) (idx->nb[1] / ti), (uint32_t) (idx->nb[2] / ti),
+        (uint32_t) (dst->nb[1] / td), (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],
+        (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2], (uint32_t) src->ne[3],
+        (uint32_t) idx->ne[1], (uint32_t) idx->ne[2], 0,
+    };
+    for (uint32_t parity = 0; parity < 2; parity++) {
+        params.back() = parity;
+        ggml_opengl_dispatch(dev, pipeline, params, { bs, bi, bd }, CEIL_DIV(n_rows, (uint32_t) GGML_GL_WG_SIZE));
+    }
+}
+
 static void ggml_opengl_set_rows(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * idx, ggml_tensor * dst) {
     if (ggml_is_empty(src) || ggml_is_empty(idx)) {
+        return;
+    }
+    if (ggml_is_quantized(dst->type)) {
+        ggml_opengl_set_rows_q(dev, src, idx, dst);
         return;
     }
     std::vector<std::string> defines = { ggml_opengl_type_define(dst->type, "DST") };
@@ -2482,8 +2521,7 @@ static void ggml_opengl_flash_attn_ext(gl_device_ctx & dev, ggml_tensor * dst) {
 
     std::vector<std::string> defines = {
         "DK=" + std::to_string(k->ne[0]), "DV=" + std::to_string(v->ne[0]),
-        k->type == GGML_TYPE_F16 ? "K_F16" : k->type == GGML_TYPE_Q8_0 ? "K_Q8_0" : "K_F32",
-        v->type == GGML_TYPE_F16 ? "V_F16" : v->type == GGML_TYPE_Q8_0 ? "V_Q8_0" : "V_F32",
+        ggml_opengl_type_define(k->type, "K"), ggml_opengl_type_define(v->type, "V"),
     };
     if (mask) {
         defines.push_back("HAS_MASK");
@@ -3541,7 +3579,11 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
     const ggml_tensor * src1 = op->src[1];
 
     auto type_ok = [](ggml_type t) {
-        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_I32;
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_I32;
+    };
+    // element types the plain data movers (CONCAT, REPEAT) copy as raw 16- or 32-bit values
+    auto raw_ok = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_I32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_I16;
     };
     // kernels index elements with 32-bit integers
     if (ggml_nelements(op) > UINT32_MAX) {
@@ -3595,7 +3637,9 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_NORM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float);
+            // src rows may be strided (nb[0] in whole floats), dst rows are packed
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] % sizeof(float) == 0 &&
+                   op->nb[0] == sizeof(float);
         case GGML_OP_CLAMP:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
@@ -3605,14 +3649,13 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             return src0->type == op->type && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                    ggml_is_contiguous(op);
         case GGML_OP_CONCAT:
-            return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_I32 || op->type == GGML_TYPE_F16) &&
-                   src0->type == op->type && src1->type == op->type;
+            return raw_ok(op->type) && src0->type == op->type && src1->type == op->type;
         case GGML_OP_UNARY:
             // the kernel writes dst by flat index
             return ggml_opengl_unary_supported(ggml_get_unary_op(op)) && src0->type == op->type &&
                    (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
         case GGML_OP_REPEAT:
-            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32;
+            return raw_ok(op->type) && src0->type == op->type;
         case GGML_OP_GATED_DELTA_NET:
             {
                 // f32 everywhere, rows of S_v (<= 512, one workgroup) elements, q/k head size equal to S_v
@@ -3747,8 +3790,8 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_CONV_2D:
             return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
-                   ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
-                   src0->ne[2] == src1->ne[2] && ggml_nelements(op) <= UINT32_MAX;
+                   src0->nb[0] % ggml_type_size(src0->type) == 0 && src1->nb[0] % sizeof(float) == 0 &&
+                   op->nb[0] == sizeof(float) && src0->ne[2] == src1->ne[2] && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_CONV_TRANSPOSE_2D:
             // Cin is walked across both inputs, so the kernel's ne[3] must match src1's ne[2]
             return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
@@ -3917,18 +3960,21 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // f32/f16/q8_0 KV, f16 mask, head sizes up to 576 and multiples of 4 (32 for q8_0); contiguous
+                // f32/f16/bf16 and q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl KV, f16 mask, head sizes up to 576 and multiples of 4
+                // (32 for the block types); contiguous
                 // rows and a contiguous dst
                 const ggml_tensor * k = op->src[1];
                 const ggml_tensor * v = op->src[2];
                 const ggml_tensor * m = op->src[3];
                 const ggml_tensor * s = op->src[4];
                 auto kv_ok = [](const ggml_tensor * t) {
-                    if (t->type == GGML_TYPE_Q8_0) {
+                    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_1 ||
+                        t->type == GGML_TYPE_Q5_0 || t->type == GGML_TYPE_Q5_1 || t->type == GGML_TYPE_IQ4_NL) {
                         return t->ne[0] <= 576 && t->ne[0] % 32 == 0 && t->nb[1] % ggml_type_size(t->type) == 0 &&
                                t->nb[2] % ggml_type_size(t->type) == 0 && t->nb[3] % ggml_type_size(t->type) == 0;
                     }
-                    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && t->nb[0] == ggml_type_size(t->type) &&
+                    return (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16) &&
+                           t->nb[0] == ggml_type_size(t->type) &&
                            t->ne[0] <= 576 && t->ne[0] % 4 == 0;
                 };
                 return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src0->nb[0] == sizeof(float) &&
@@ -3936,6 +3982,13 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                        (!s || s->type == GGML_TYPE_F32) && ggml_is_contiguous(op);
             }
         case GGML_OP_SET_ROWS:
+            if (op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_Q4_1 ||
+                op->type == GGML_TYPE_Q5_0 || op->type == GGML_TYPE_Q5_1) {
+                // rows quantized in place (set_rows_q.comp): contiguous dst, contiguous f32 source rows
+                return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32) &&
+                       ggml_is_contiguous(op) && src0->nb[0] == sizeof(float) && op->ne[0] % 32 == 0 &&
+                       ggml_nbytes(op) < (1ull << 31);
+            }
             // src f32 into f32 / f16, or f16 into f16
             return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && src0->type == GGML_TYPE_F32 ||
                     op->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F16) &&
@@ -3955,6 +4008,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ1_S:
                 case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0:
+                case GGML_TYPE_NVFP4:
                     // whole blocks per row, as the matrix-vector kernel reads them
                     return op->type == GGML_TYPE_F32 && src0->ne[0] % ggml_blck_size(src0->type) == 0 &&
                            src0->nb[1] % ggml_type_size(src0->type) == 0 && src0->nb[2] % ggml_type_size(src0->type) == 0 &&
@@ -3966,7 +4020,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_MUL_MAT:
             // contiguous rows. Float weights (f32 / f16 / bf16): any k, f32 or f16 columns. Q4_0 / Q4_1 / Q5_0 / Q5_1 /
-            // Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ* / MXFP4 / TQ2_0 / Q1_0 / Q2_0 weights: whole blocks, f32 columns
+            // Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K / IQ* / MXFP4 / NVFP4 / TQ2_0 / Q1_0 / Q2_0 weights: whole blocks, f32 columns
             if (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q4_1 || src0->type == GGML_TYPE_Q5_0 ||
                 src0->type == GGML_TYPE_Q5_1 || src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_Q4_K ||
                 src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K ||
@@ -3974,7 +4028,8 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ2_S ||
                 src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS ||
                 src0->type == GGML_TYPE_IQ1_S || src0->type == GGML_TYPE_IQ1_M || src0->type == GGML_TYPE_MXFP4 ||
-                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0) {
+                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0 ||
+                src0->type == GGML_TYPE_NVFP4) {
                 return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        src0->ne[0] % ggml_blck_size(src0->type) == 0;
@@ -3994,7 +4049,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ1_S:
                 case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_TQ2_0: case GGML_TYPE_Q1_0:
-                case GGML_TYPE_Q2_0:
+                case GGML_TYPE_Q2_0: case GGML_TYPE_NVFP4:
                     return src0->ne[0] % ggml_blck_size(src0->type) == 0;
                 case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:
                     return true;
