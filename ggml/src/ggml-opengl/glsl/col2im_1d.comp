@@ -2,7 +2,7 @@
 
 // Port of the D3D12 col2im_1d.hlsl (tools/hlsl2glsl/port.py + hand fixes).
 
-// COL2IM_1D (f32): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
+// COL2IM_1D (f32, or f16 with -DCOL_F16 for columns and signal): scatter-add columns [K*OC, T_in] back to a signal [T_out, OC].
 // The CPU already gathers rather than scatters, so this is a direct transcription: one thread owns
 // one output sample and sums the at most ceil(K/s) columns that overlap it.
 
@@ -21,6 +21,14 @@ layout(std140, binding = 0) uniform Params {
     uint ne;
     uint nwg_x;
 };
+
+#if defined(COL_F16)
+#define LOAD_COL(b, i)     LOAD_F16(b, i)
+#define STORE_COL(b, i, v) STORE_F16(b, i, v)
+#else
+#define LOAD_COL(b, i)     LOAD_F32(b, i)
+#define STORE_COL(b, i, v) STORE_F32(b, i, v)
+#endif
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -48,8 +56,8 @@ void main() {
     for (int c = lo; c <= hi; c++) {
         const int k = t_abs - c * s0;
         if (k >= 0 && k < int(kk)) {
-            sum += LOAD_F32(src, offset_src + (oc * kk + uint(k)) + uint(c) * k_oc);
+            sum += LOAD_COL(src, offset_src + (oc * kk + uint(k)) + uint(c) * k_oc);
         }
     }
-    STORE_F32(dst, offset_dst + i, sum);
+    STORE_COL(dst, offset_dst + i, sum);
 }
