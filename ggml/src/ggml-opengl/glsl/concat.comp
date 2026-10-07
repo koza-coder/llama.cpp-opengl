@@ -1,0 +1,98 @@
+#include "common.glsl"
+
+// Port of the D3D11 concat.hlsl. CONCAT of two 4-byte tensors (f32 or i32, copied as raw bits) along dim; any strides
+// ELEM16: 2-byte elements (f16, bf16, i16), ELEM8: 1-byte (i8), ELEM64: 8-byte (i64): strides and offsets are then in
+// units of the element size; a half or byte is written with two atomics so its neighbours are kept; 8-byte elements move as
+// two words. ELEMBLK=<bytes>: quantised blocks (even size), one element is one block, ne0 etc. count blocks; copied as halves
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Src0 { uint src0[]; };
+layout(std430, binding = 1) buffer Src1 { uint src1[]; };
+layout(std430, binding = 2) buffer Dst  { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_src0;
+    uint offset_src1;
+    uint offset_dst;
+
+    uint stride_src00;
+    uint stride_src01;
+    uint stride_src02;
+    uint stride_src03;
+    uint stride_src10;
+    uint stride_src11;
+    uint stride_src12;
+    uint stride_src13;
+    uint stride_dst0;
+    uint stride_dst1;
+    uint stride_dst2;
+    uint stride_dst3;
+
+    uint ne;
+    uint ne0;
+    uint ne1;
+    uint ne2;
+
+    uint dim;
+    uint src0_nedim;   // src0->ne[dim]
+
+    uint nwg_x;
+};
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+    uint idx[4];
+    idx[3] = i / (ne2 * ne1 * ne0);
+    i = i % (ne2 * ne1 * ne0);
+    idx[2] = i / (ne1 * ne0);
+    i = i % (ne1 * ne0);
+    idx[1] = i / ne0;
+    idx[0] = i % ne0;
+
+    const uint i_dst = offset_dst + idx[0] * stride_dst0 + idx[1] * stride_dst1 + idx[2] * stride_dst2 + idx[3] * stride_dst3;
+    const bool from0 = idx[dim] < src0_nedim;
+    uint j;
+    if (from0) {
+        j = offset_src0 + idx[0] * stride_src00 + idx[1] * stride_src01 + idx[2] * stride_src02 + idx[3] * stride_src03;
+    } else {
+        idx[dim] -= src0_nedim;
+        j = offset_src1 + idx[0] * stride_src10 + idx[1] * stride_src11 + idx[2] * stride_src12 + idx[3] * stride_src13;
+    }
+#if defined(ELEM16)
+    uint bits;
+    if (from0) { LOAD_U16_UNALIGNED(src0, j * 2u, bits); } else { LOAD_U16_UNALIGNED(src1, j * 2u, bits); }
+    const uint sh = ((i_dst * 2u) & 2u) * 8u;
+    atomicAnd(dst[(i_dst * 2u) >> 2], ~(0xFFFFu << sh));
+    atomicOr(dst[(i_dst * 2u) >> 2], bits << sh);
+#elif defined(ELEM8)
+    const uint w    = from0 ? src0[j >> 2] : src1[j >> 2];
+    const uint bits = (w >> ((j & 3u) * 8u)) & 0xFFu;
+    const uint sh   = (i_dst & 3u) * 8u;
+    atomicAnd(dst[i_dst >> 2], ~(0xFFu << sh));
+    atomicOr(dst[i_dst >> 2], bits << sh);
+#elif defined(ELEM64)
+    if (from0) {
+        dst[i_dst * 2u]      = src0[j * 2u];
+        dst[i_dst * 2u + 1u] = src0[j * 2u + 1u];
+    } else {
+        dst[i_dst * 2u]      = src1[j * 2u];
+        dst[i_dst * 2u + 1u] = src1[j * 2u + 1u];
+    }
+#elif defined(ELEMBLK)
+    for (uint h = 0u; h < uint(ELEMBLK) / 2u; h++) {
+        uint v;
+        const uint a = j * uint(ELEMBLK) + h * 2u;
+        if (from0) { LOAD_U16_UNALIGNED(src0, a, v); } else { LOAD_U16_UNALIGNED(src1, a, v); }
+        const uint da = i_dst * uint(ELEMBLK) + h * 2u;
+        const uint sh = (da & 2u) * 8u;
+        atomicAnd(dst[da >> 2], ~(0xFFFFu << sh));
+        atomicOr(dst[da >> 2], v << sh);
+    }
+#else
+    dst[i_dst] = from0 ? src0[j] : src1[j];
+#endif
+}

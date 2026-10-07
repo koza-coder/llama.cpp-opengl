@@ -1,0 +1,27 @@
+#include "common.glsl"
+
+// FILL: every element of the contiguous dst = value. f32, or f16 with DST_F16.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Dst { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint  offset_dst;
+    uint  ne;
+    float value;
+
+    uint nwg_x;
+};
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+#if defined(DST_F16)
+    STORE_F16(dst, offset_dst + i, value);
+#else
+    STORE_F32(dst, offset_dst + i, value);
+#endif
+}

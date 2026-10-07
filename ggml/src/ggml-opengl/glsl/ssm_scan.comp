@@ -1,0 +1,101 @@
+#include "common.glsl"
+
+// Port of the D3D12 ssm_scan.hlsl. SSM_SCAN (f32): the selective state space recurrence behind Mamba-1 and Mamba-2.
+//
+//   s[i0] = s_prev[i0] * dA + B[i0] * (x * softplus(dt))
+//   y     = dot(s, C)
+//
+// One thread per (sequence, head, dim); the token loop carries state and stays inside the thread.
+// The first token reads the incoming state from src0 at ids[seq]; later tokens read back what this
+// same thread wrote into dst.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer SrcS0  { uint src_s0[]; };   // s  {d_state, dim, n_head, n_seqs}
+layout(std430, binding = 1) buffer SrcX   { uint src_x[]; };    // x  {dim, n_head, n_tokens, n_seqs}
+layout(std430, binding = 2) buffer SrcDt  { uint src_dt[]; };   // dt {n_head, n_tokens, n_seqs}
+layout(std430, binding = 3) buffer SrcA   { uint src_A[]; };    // A  {d_state, n_head} or {1, n_head}
+layout(std430, binding = 4) buffer SrcB   { uint src_B[]; };    // B  {d_state, n_group, n_tokens, n_seqs}
+layout(std430, binding = 5) buffer SrcC   { uint src_C[]; };    // C  {d_state, n_group, n_tokens, n_seqs}
+layout(std430, binding = 6) buffer SrcIds { uint src_ids[]; };  // ids {n_seqs}, i32
+layout(std430, binding = 7) buffer Dst    { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_s0;
+    uint offset_x;
+    uint offset_dt;
+    uint offset_A;
+    uint offset_B;
+    uint offset_C;
+    uint offset_ids;
+    uint offset_dst;
+    uint stride_s3;    // src0 nb[3], the per-sequence state stride
+    uint stride_x2;
+    uint stride_x3;
+    uint stride_dt1;
+    uint stride_dt2;
+    uint stride_B2;
+    uint stride_B3;
+    uint stride_C2;
+    uint stride_C3;
+    uint nc;           // d_state
+    uint nr;           // dim
+    uint nh;           // n_head
+    uint ng;           // n_group
+    uint nt;           // tokens per sequence
+    uint ns;           // sequences
+    uint kk;           // K, the number of state snapshots
+    uint s_off;        // element offset of the state area inside dst
+    uint mamba2;       // 1 when A has one element per head
+    uint n_jobs;       // ns * nh * nr
+    uint nwg_x;
+};
+
+float softplus(float x) {
+    return x > 20.0 ? x : log(1.0 + exp(x));
+}
+
+void main() {
+    const uint job = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (job >= n_jobs) {
+        return;
+    }
+    const uint i3 = job / (nh * nr);         // sequence
+    const uint ii = job % (nh * nr);         // dim within head, flattened as i1 + h * nr
+    const uint h  = ii / nr;
+    const uint g  = h / (nh / ng);           // repeat_interleave of the group index
+
+    const uint seq_id = uint(LOAD_I32(src_ids, offset_ids + i3));
+    const uint s_in   = offset_s0 + seq_id * stride_s3 + ii * nc;
+    const uint s_out  = offset_dst + s_off + i3 * stride_s3 + ii * nc;
+
+    for (uint i2 = 0u; i2 < nt; i2++) {
+        const float dt_sp = softplus(LOAD_F32(src_dt, offset_dt + i2 * stride_dt1 + i3 * stride_dt2 + h));
+        const float x_dt  = LOAD_F32(src_x, offset_x + i2 * stride_x2 + i3 * stride_x3 + ii) * dt_sp;
+
+        const uint b_row = offset_B + i2 * stride_B2 + i3 * stride_B3 + g * nc;
+        const uint c_row = offset_C + i2 * stride_C2 + i3 * stride_C3 + g * nc;
+
+        // Mamba-2 hoists the decay out of the state loop; Mamba-1 has one per state
+        const float dA_head = mamba2 != 0u ? exp(dt_sp * LOAD_F32(src_A, offset_A + h)) : 0.0;
+
+        float sumf = 0.0;
+        for (uint i0 = 0u; i0 < nc; i0++) {
+            const float prev  = i2 == 0u ? LOAD_F32(src_s0, s_in + i0) : LOAD_F32(dst, s_out + i0);
+            const float dA    = mamba2 != 0u ? dA_head : exp(dt_sp * LOAD_F32(src_A, offset_A + i0 + h * nc));
+            const float state = prev * dA + LOAD_F32(src_B, b_row + i0) * x_dt;
+            sumf += state * LOAD_F32(src_C, c_row + i0);
+            STORE_F32(dst, s_out + i0, state);
+        }
+        STORE_F32(dst, offset_dst + i2 * (nh * nr) + i3 * (nt * nh * nr) + ii, sumf);
+
+        // state snapshots for the last K - 1 tokens, kept for speculative decoding
+        const uint slot = nt - 1u - i2;
+        if (kk > 1u && slot > 0u && slot < kk) {
+            const uint snap = offset_dst + s_off + (slot * ns + i3) * stride_s3 + ii * nc;
+            for (uint j = 0u; j < nc; j++) {
+                STORE_F32(dst, snap + j, LOAD_F32(dst, s_out + j));
+            }
+        }
+    }
+}

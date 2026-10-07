@@ -1,0 +1,34 @@
+#include "common.glsl"
+
+// Port of the D3D12 get_rel_pos.hlsl (tools/hlsl2glsl/port.py + hand fixes).
+
+// GET_REL_POS (f16): dst[i2, i1, i0] = src[((ne1 - i1 - 1) + i2) * src_ne0 + i0].
+// Both sides are contiguous f16; this is the SAM relative position lookup.
+
+layout(std430, binding = 0) buffer Buf0 { uint src[]; };
+layout(std430, binding = 1) buffer Buf1 { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_src;
+    uint offset_dst;
+    uint src_ne0;
+    uint ne0;
+    uint ne1;
+    uint ne;
+    uint nwg_x;
+};
+
+layout(local_size_x = WG_SIZE) in;
+
+void main() {
+    const uvec3 gid = gl_GlobalInvocationID;
+    const uint i = flat_index(gid, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+    const uint i0 = i % ne0;
+    const uint i1 = (i / ne0) % ne1;
+    const uint i2 = i / (ne0 * ne1);
+    const uint pos = (ne1 - i1 - 1u) + i2;
+    STORE_F16(dst, offset_dst + i, LOAD_F16(src, offset_src + pos * src_ne0 + i0));
+}

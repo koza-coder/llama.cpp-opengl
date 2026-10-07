@@ -1,0 +1,58 @@
+#include "common.glsl"
+
+// DSV4_HC_POST (hyper-connections), one thread per output:
+//   dst[i, d, t] = x[i, t] * post[d, t] + sum_s residual[i, s, t] * comb[d, s, t]    (HAS_COMB)
+//   dst[i, d, t] = x[i, t] * post[d, t] + residual[i, d, t]                          (no comb: identity)
+// f32; offsets and strides in elements, element 0 of every tensor contiguous.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer X    { uint x_buf[]; };
+layout(std430, binding = 1) buffer Res  { uint r_buf[]; };
+layout(std430, binding = 2) buffer Post { uint p_buf[]; };
+layout(std430, binding = 3) buffer Comb { uint c_buf[]; };
+layout(std430, binding = 4) buffer Dst  { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_x;
+    uint offset_r;
+    uint offset_p;
+    uint offset_c;
+    uint offset_dst;
+
+    uint stride_x1;
+    uint stride_r1;
+    uint stride_r2;
+    uint stride_p1;
+    uint stride_c1;
+    uint stride_c2;
+    uint stride_d1;
+    uint stride_d2;
+
+    uint n_embd;
+    uint hc;
+    uint n_out;
+
+    uint nwg_x;
+};
+
+void main() {
+    uint i = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (i >= n_out) {
+        return;
+    }
+    uint i0 = i % n_embd;
+    uint d  = (i / n_embd) % hc;
+    uint t  = i / (n_embd * hc);
+
+    float sum = LOAD_F32(x_buf, offset_x + i0 + t * stride_x1) * LOAD_F32(p_buf, offset_p + d + t * stride_p1);
+#if defined(HAS_COMB)
+    for (uint s = 0u; s < hc; s++) {
+        sum += LOAD_F32(r_buf, offset_r + i0 + s * stride_r1 + t * stride_r2) *
+               LOAD_F32(c_buf, offset_c + d + s * stride_c1 + t * stride_c2);
+    }
+#else
+    sum += LOAD_F32(r_buf, offset_r + i0 + d * stride_r1 + t * stride_r2);
+#endif
+    STORE_F32(dst, offset_dst + i0 + d * stride_d1 + t * stride_d2, sum);
+}

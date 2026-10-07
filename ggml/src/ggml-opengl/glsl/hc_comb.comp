@@ -1,0 +1,85 @@
+#include "common.glsl"
+
+// DSV4_HC_COMB (hyper-connections, hc = 4), one thread per token, after the CPU op:
+//   logits[d, s] = mixes[8 + d + 4 s, t] * scale[2] + base[8 + d + 4 s]; softmax over d, + eps; normalize the columns
+//   (over s, sum + eps), then n_iter - 1 times rows (over d) and columns. dst[d, s, t]. f32; strides in elements.
+
+layout(local_size_x = WG_SIZE) in;
+
+layout(std430, binding = 0) buffer Mixes { uint m_buf[]; };
+layout(std430, binding = 1) buffer Scale { uint s_buf[]; };
+layout(std430, binding = 2) buffer Base  { uint b_buf[]; };
+layout(std430, binding = 3) buffer Dst   { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_m;
+    uint offset_s;
+    uint offset_b;
+    uint offset_dst;
+
+    uint stride_m1;
+    uint stride_d1;
+    uint stride_d2;
+
+    uint  n_tokens;
+    float eps;
+    uint  n_iter;
+
+    uint nwg_x;
+};
+
+void main() {
+    uint t = flat_index(gl_GlobalInvocationID, nwg_x);
+    if (t >= n_tokens) {
+        return;
+    }
+    float sc = LOAD_F32(s_buf, offset_s + 2u);
+    float c[16];
+    for (uint s = 0u; s < 4u; s++) {
+        float mx = -1.0 / 0.0;
+        for (uint d = 0u; d < 4u; d++) {
+            uint  k = d + 4u * s;
+            float v = LOAD_F32(m_buf, offset_m + 8u + k + t * stride_m1) * sc + LOAD_F32(b_buf, offset_b + 8u + k);
+            c[k] = v;
+            mx   = max(mx, v);
+        }
+        float sum = 0.0;
+        for (uint d = 0u; d < 4u; d++) {
+            c[d + 4u * s] = exp(c[d + 4u * s] - mx);
+            sum += c[d + 4u * s];
+        }
+        float inv = 1.0 / sum;
+        for (uint d = 0u; d < 4u; d++) {
+            c[d + 4u * s] = c[d + 4u * s] * inv + eps;
+        }
+    }
+    for (uint it = 0u; it < n_iter; it++) {
+        if (it > 0u) {
+            // rows: over d for each s
+            for (uint s = 0u; s < 4u; s++) {
+                float sum = eps;
+                for (uint d = 0u; d < 4u; d++) {
+                    sum += c[d + 4u * s];
+                }
+                for (uint d = 0u; d < 4u; d++) {
+                    c[d + 4u * s] *= 1.0 / sum;
+                }
+            }
+        }
+        // columns: over s for each d
+        for (uint d = 0u; d < 4u; d++) {
+            float sum = eps;
+            for (uint s = 0u; s < 4u; s++) {
+                sum += c[d + 4u * s];
+            }
+            for (uint s = 0u; s < 4u; s++) {
+                c[d + 4u * s] *= 1.0 / sum;
+            }
+        }
+    }
+    for (uint s = 0u; s < 4u; s++) {
+        for (uint d = 0u; d < 4u; d++) {
+            STORE_F32(dst, offset_dst + d + s * stride_d1 + t * stride_d2, c[d + 4u * s]);
+        }
+    }
+}

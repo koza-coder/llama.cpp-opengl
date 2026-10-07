@@ -1,0 +1,135 @@
+#include "common.glsl"
+
+// GATED_DELTA_NET (f32), following the CPU reference and the D3D11 gated_delta_net.hlsl. Every state row j of every
+// (sequence, head) evolves on its own; for each token t
+//   row *= exp(g)  (scalar g, or per element for KDA)
+//   delta = (v[j] - dot(row, k)) * beta;  row += delta * k;  out[t, j] = dot(row, q) * scale
+// Unlike D3D11 there is no per-thread row array (the AMD GL compiler got per-thread vec4 arrays wrong or crashed on
+// them in flash attention, exp27-exp30): one workgroup per row, thread a holds row[a], and both dot products are
+// shared-memory reductions. dst holds the attention output [S_v * H * n_tokens * n_seqs] followed by K state
+// snapshots [S_v * S_v * H * n_seqs each]. defines: S_V, RED (power of two >= S_V, the workgroup size), KDA
+
+layout(local_size_x = RED) in;
+
+layout(std430, binding = 0) buffer Q   { uint q_buf[]; };
+layout(std430, binding = 1) buffer K   { uint k_buf[]; };
+layout(std430, binding = 2) buffer V   { uint v_buf[]; };
+layout(std430, binding = 3) buffer G   { uint g_buf[]; };
+layout(std430, binding = 4) buffer B   { uint b_buf[]; };
+layout(std430, binding = 5) buffer S   { uint s_buf[]; };
+layout(std430, binding = 6) buffer Dst { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint offset_q;
+    uint offset_k;
+    uint offset_v;
+    uint offset_g;
+    uint offset_b;
+    uint offset_s;
+    uint offset_dst;
+
+    uint stride_q1;
+    uint stride_q2;
+    uint stride_q3;
+    uint stride_k1;
+    uint stride_k2;
+    uint stride_k3;
+    uint stride_v1;
+    uint stride_v2;
+    uint stride_v3;
+    uint stride_g1;
+    uint stride_g2;
+    uint stride_g3;
+    uint stride_b1;
+    uint stride_b2;
+    uint stride_b3;
+
+    uint n_head;
+    uint n_tokens;
+    uint neq1;
+    uint nek1;
+    uint rq3;
+    uint rk3;
+    uint state_seq_stride;   // src_state->nb[3] in elements
+    uint n_snap;             // K
+    uint n_rows;             // n_seqs * n_head * S_V
+    float scale;
+    uint offset_st;          // dst state area
+    uint st_slot_stride;
+
+    uint nwg_x;
+};
+
+shared float red[RED];
+
+// every thread of the workgroup must call this (it has barriers)
+float wg_sum(float x) {
+    const uint a = gl_LocalInvocationID.x;
+    red[a] = x;
+    barrier();
+    for (uint s = RED / 2; s > 0; s >>= 1) {
+        if (a < s) {
+            red[a] += red[a + s];
+        }
+        barrier();
+    }
+    const float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const uint r = gl_WorkGroupID.x + nwg_x * gl_WorkGroupID.y;
+    if (r >= n_rows) {
+        return;   // whole workgroup
+    }
+    const uint a   = gl_LocalInvocationID.x;
+    const bool act = a < uint(S_V);
+
+    const uint iv3 = r / (n_head * S_V);
+    const uint iv1 = (r / S_V) % n_head;
+    const uint j   = r % S_V;
+    const uint iq1 = iv1 % neq1;
+    const uint ik1 = iv1 % nek1;
+    const uint iq3 = iv3 / rq3;
+    const uint ik3 = iv3 / rk3;
+
+    const uint state_row = (iv3 * n_head + iv1) * S_V * S_V + j * S_V;
+
+    float row = act ? LOAD_F32(s_buf, offset_s + iv3 * state_seq_stride + iv1 * S_V * S_V + j * S_V + a) : 0.0;
+
+    for (uint t = 0; t < n_tokens; t++) {
+        const uint q_base = offset_q + iq3 * stride_q3 + t * stride_q2 + iq1 * stride_q1;
+        const uint k_base = offset_k + ik3 * stride_k3 + t * stride_k2 + ik1 * stride_k1;
+        const uint g_base = offset_g + iv3 * stride_g3 + t * stride_g2 + iv1 * stride_g1;
+
+#if defined(KDA)
+        row *= act ? exp(LOAD_F32(g_buf, g_base + a)) : 1.0;
+#else
+        row *= exp(LOAD_F32(g_buf, g_base));
+#endif
+        const float kk = act ? LOAD_F32(k_buf, k_base + a) : 0.0;
+        const float qq = act ? LOAD_F32(q_buf, q_base + a) : 0.0;
+
+        const float sum   = wg_sum(row * kk);
+        const float v     = LOAD_F32(v_buf, offset_v + iv3 * stride_v3 + t * stride_v2 + iv1 * stride_v1 + j);
+        const float beta  = LOAD_F32(b_buf, offset_b + iv3 * stride_b3 + t * stride_b2 + iv1 * stride_b1);
+        const float delta = (v - sum) * beta;
+        row += delta * kk;
+        const float out_v = wg_sum(row * qq);
+        if (a == 0u) {
+            STORE_F32(dst, offset_dst + (iv3 * n_tokens * n_head + t * n_head + iv1) * S_V + j, out_v * scale);
+        }
+
+        if (n_snap > 1u) {
+            const int slot = int(n_tokens) - 1 - int(t);
+            if (act && slot >= 0 && slot < int(n_snap)) {
+                STORE_F32(dst, offset_st + uint(slot) * st_slot_stride + state_row + a, row);
+            }
+        }
+    }
+
+    if (n_snap == 1u && act) {
+        STORE_F32(dst, offset_st + state_row + a, row);
+    }
+}

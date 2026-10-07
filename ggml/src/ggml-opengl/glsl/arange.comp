@@ -1,0 +1,26 @@
+#include "common.glsl"
+
+// Port of the D3D12 arange.hlsl (tools/hlsl2glsl/port.py + hand fixes).
+
+// ARANGE (f32): dst[i] = start + step * i over a contiguous destination
+
+layout(std430, binding = 0) buffer Buf0 { uint dst[]; };
+
+layout(std140, binding = 0) uniform Params {
+    uint  offset_dst;
+    uint  ne;
+    float start;
+    float step;
+    uint  nwg_x;
+};
+
+layout(local_size_x = WG_SIZE) in;
+
+void main() {
+    const uvec3 gid = gl_GlobalInvocationID;
+    const uint i = flat_index(gid, nwg_x);
+    if (i >= ne) {
+        return;
+    }
+    STORE_F32(dst, offset_dst + i, start + step * float(i));
+}
