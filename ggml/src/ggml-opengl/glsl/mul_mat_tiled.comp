@@ -500,6 +500,33 @@ void load_a_row(uint row_base, uint k0, uint col) {
             }
         }
     }
+#elif defined(SRC0_TQ1_0)
+    // block of 256 (54 bytes): qs[48] (5 digits per byte), qh[4] (4 digits per byte), f16 d. Element e of the block:
+    // e < 160: digit e / 32 of qs byte e % 32; e < 240: digit (e - 160) / 16 of qs byte 32 + (e - 160) % 16;
+    // else digit (e - 240) / 4 of qh byte (e - 240) % 4. Digit = ((byte * 3^n) & 255) * 3 >> 8, minus 1, times d.
+    {
+        const uint POW3_TQ1[5] = uint[5](1u, 3u, 9u, 27u, 81u);
+        uint blk  = k0 / 256u;
+        uint e0   = k0 % 256u;
+        uint base = (row_base + blk) * 54u;
+        uint dbits;
+        LOAD_U16_UNALIGNED(src0, base + 52u, dbits);
+        float d = f16_to_f32(dbits);
+        for (uint i = 0u; i < 32u; i++) {
+            uint e = e0 + i;
+            uint n, bi;
+            if (e < 160u) {
+                n = e / 32u; bi = e % 32u;
+            } else if (e < 240u) {
+                n = (e - 160u) / 16u; bi = 32u + (e - 160u) % 16u;
+            } else {
+                n = (e - 240u) / 4u; bi = 48u + (e - 240u) % 4u;
+            }
+            uint q;
+            LOAD_U32_UNALIGNED(src0, base + (bi & ~3u), q);
+            Atile[i][col] = (float((((BYTE_OF(q, bi & 3u) * POW3_TQ1[n]) & 0xFFu) * 3u) >> 8) - 1.0) * d;
+        }
+    }
 #elif defined(SRC0_IQ2_XXS)
     // super-block of 256 (66 bytes): f16 d, then 32 uint16 qs. Each sub-block of 32 reads two uint32: the
     // first is four grid indices, the second carries the four 7-bit sign codes and, in its top nibble, the
