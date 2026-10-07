@@ -44,11 +44,15 @@ void main() {
     const uint dst_row = offset_dst + view_offset + i3 * view_nb3 + i2 * view_nb2 + i1 * view_nb1;
 
     for (uint c = gtid.x; c < ne10; c += WG_SIZE) {
+#ifdef RAW
+        dst[dst_row + c] = src1[src_row + c];
+#else
         const float v = LOAD_F32(src1, src_row + c);
 #ifdef ACC
         STORE_F32(dst, dst_row + c, LOAD_F32(dst, dst_row + c) + v);
 #else
         STORE_F32(dst, dst_row + c, v);
+#endif
 #endif
     }
 }

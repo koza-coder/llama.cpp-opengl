@@ -230,11 +230,26 @@ void quant_block(uint s) {
         g_blk[2 + j4] = L[j4] | (L[16u + j4] << 4);
     }
 #elif defined(QT_Q1_0)
-    float sum_abs = 0.0;
+    // IEEE round-to-nearest-even add of non-negative floats done with integer ops: the Intel driver compiler
+    // changes the result of a float sum, this keeps the exact sequential sum of quantize_row_q1_0_ref
+    uint sum_bits = 0u;
     for (uint j = 0; j < 128u; j++) {
-        sum_abs += abs(v[j]);
+        uint a = sum_bits, b = floatBitsToUint(abs(v[j]));
+        if (a < b) { const uint t = a; a = b; b = t; }
+        const uint ea = max(a >> 23, 1u), eb = max(b >> 23, 1u);
+        const uint ma = (a & 0x7fffffu) | ((a >> 23) != 0u ? 0x800000u : 0u);
+        const uint mb = (b & 0x7fffffu) | ((b >> 23) != 0u ? 0x800000u : 0u);
+        const uint dsh = ea - eb;
+        uint A = ma << 3, B = mb << 3;
+        if (dsh >= 27u) { B = (B != 0u) ? 1u : 0u; } else { const uint st = (B & ((1u << dsh) - 1u)) != 0u ? 1u : 0u; B = (B >> dsh) | st; }
+        uint S = A + B, e = ea;
+        if ((S >> 27) != 0u) { S = (S >> 1) | (S & 1u); e += 1u; }
+        const uint rb = S & 7u;
+        S >>= 3;
+        if (rb > 4u || (rb == 4u && (S & 1u) != 0u)) { S += 1u; }
+        sum_bits = ((e - 1u) << 23) + S;
     }
-    put16(0, f32_to_f16_rne(sum_abs / 128.0));
+    put16(0, f32_to_f16_rne(uintBitsToFloat(sum_bits) * 0.0078125));
     for (uint j2 = 0; j2 < 128u; j2++) {
         if (v[j2] >= 0.0) {
             g_blk[2 + j2 / 8u] |= 1u << (j2 % 8u);

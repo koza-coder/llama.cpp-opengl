@@ -29,8 +29,10 @@ layout(std140, binding = 0) uniform Params {
     uint ne1;
     uint ne2;
 
-    float p0;   // clamp min
-    float p1;   // clamp max
+    float p0;   // clamp min; XIELU: beta + softplus(alpha_n)
+    float p1;   // clamp max; XIELU: softplus(alpha_p)
+    float p2;   // XIELU: op_params 3
+    float p3;   // XIELU: op_params 4
 
     uint nwg_x;
 };
@@ -68,6 +70,10 @@ float apply(float x) {
     return exp(x);
 #elif defined(LOG)
     return log(x);
+#elif defined(LEAKY_RELU)
+    return x > 0.0 ? x : x * p0;
+#elif defined(XIELU)
+    return x > 0.0 ? p1 * x * x + p2 * x : (exp(min(x, p3)) - 1.0 - x) * p0 + p2 * x;
 #elif defined(CLAMP)
     return clamp(x, p0, p1);
 #elif defined(HARDSWISH)

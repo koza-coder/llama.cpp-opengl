@@ -1,7 +1,7 @@
 #include "common.glsl"
 
 // Port of the D3D12 upscale.hlsl. UPSCALE (f32), nearest, bilinear or bicubic (alpha -0.75, with or without align
-// corners), following the CPU reference; one thread per dst element, any strides. defines: BILINEAR or BICUBIC
+// corners), following the CPU reference; one thread per dst element, any strides. defines: BILINEAR, ANTIALIAS (bilinear + antialias) or BICUBIC
 
 layout(local_size_x = WG_SIZE) in;
 
@@ -74,6 +74,36 @@ void main() {
         rows[r] = cubic(p[0], p[1], p[2], p[3], dx);
     }
     STORE_F32(dst, o, cubic(rows[0], rows[1], rows[2], rows[3], dy));
+#elif defined(ANTIALIAS)
+    // bilinear with antialiasing (triangle filter, PyTorch-style), same order of operations as the CPU reference
+    const float support1  = max(1.0, 1.0 / sf1);
+    const float invscale1 = 1.0 / support1;
+    const float support0  = max(1.0, 1.0 / sf0);
+    const float invscale0 = 1.0 / support0;
+    const float y = (float(i1) + pixel_offset) / sf1;
+    const float x = (float(i0) + pixel_offset) / sf0;
+    const int x_min = max(int(x - support0 + pixel_offset), 0);
+    const int x_max = min(int(x + support0 + pixel_offset), int(src_ne0));
+    const int y_min = max(int(y - support1 + pixel_offset), 0);
+    const int y_max = min(int(y + support1 + pixel_offset), int(src_ne1));
+    float val = 0.0;
+    float total_weight = 0.0;
+    for (int sy = y_min; sy < y_max; sy++) {
+        const float weight_y = max(1.0 - abs((float(sy) - y + pixel_offset) * invscale1), 0.0);
+        for (int sx = x_min; sx < x_max; sx++) {
+            const float weight_x = max(1.0 - abs((float(sx) - x + pixel_offset) * invscale0), 0.0);
+            const float weight = weight_x * weight_y;
+            if (weight <= 0.0) {
+                continue;
+            }
+            val += LOAD_F32(src, base + uint(sx) * stride_src0 + uint(sy) * stride_src1) * weight;
+            total_weight += weight;
+        }
+    }
+    if (total_weight > 0.0) {
+        val /= total_weight;
+    }
+    STORE_F32(dst, o, val);
 #elif defined(BILINEAR)
     const float y  = (float(i1) + pixel_offset) / sf1 - pixel_offset;
     const int   fy = int(floor(y));

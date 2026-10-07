@@ -1285,7 +1285,9 @@ static void ggml_opengl_upscale(gl_device_ctx & dev, ggml_tensor * src, ggml_ten
         sf1 = dst->ne[1] > 1 && src->ne[1] > 1 ? (float) (dst->ne[1] - 1) / (src->ne[1] - 1) : sf1;
     }
     std::vector<std::string> defines;
-    if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR) {
+    if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR && (mode_flags & GGML_SCALE_FLAG_ANTIALIAS)) {
+        defines.push_back("ANTIALIAS");
+    } else if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BILINEAR) {
         defines.push_back("BILINEAR");
     } else if ((mode_flags & 0xFF) == GGML_SCALE_MODE_BICUBIC) {
         defines.push_back("BICUBIC");
@@ -1528,8 +1530,14 @@ static void ggml_opengl_pad_reflect_1d(gl_device_ctx & dev, ggml_tensor * src, g
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, n_rows);
 }
 
-// LEAKY_RELU: negative inputs scaled by the slope in op_params
+static void ggml_opengl_unary(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst);
+
+// LEAKY_RELU: negative inputs scaled by the slope in op_params; f16 goes through unary.comp (LEAKY_RELU define)
 static void ggml_opengl_leaky_relu(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
+    if (dst->type == GGML_TYPE_F16) {
+        ggml_opengl_unary(dev, src, dst);
+        return;
+    }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "leaky_relu", glsl_leaky_relu, {});
     const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
@@ -1896,8 +1904,10 @@ static void ggml_opengl_add_rel_pos(gl_device_ctx & dev, ggml_tensor * src0, ggm
 }
 
 static void ggml_opengl_col2im_1d(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst) {
-    const bool f16 = src->type == GGML_TYPE_F16;
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, f16 ? "col2im_1d_f16" : "col2im_1d", glsl_col2im_1d,
+    const bool f16  = src->type == GGML_TYPE_F16;
+    const bool bf16 = src->type == GGML_TYPE_BF16;
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, bf16 ? "col2im_1d_bf16" : f16 ? "col2im_1d_f16" : "col2im_1d", glsl_col2im_1d,
+                                                      bf16 ? std::vector<std::string>{ "COL_BF16" } :
                                                       f16 ? std::vector<std::string>{ "COL_F16" } : std::vector<std::string>{});
     const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
@@ -2099,8 +2109,12 @@ static void ggml_opengl_set_acc(gl_device_ctx & dev, ggml_tensor * src0, ggml_te
     if (acc) {
         defines.push_back("ACC");
     }
+    const bool raw = src1->type == GGML_TYPE_I32;
+    if (raw) {
+        defines.push_back("RAW");
+    }
     gl_pipeline & pipeline =
-        ggml_opengl_get_pipeline(dev, acc ? "set_acc_add" : "set_acc", glsl_set_acc, defines);
+        ggml_opengl_get_pipeline(dev, acc ? "set_acc_add" : raw ? "set_acc_raw" : "set_acc", glsl_set_acc, defines);
     const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
     const uint32_t      n_rows = (uint32_t) ggml_nrows(src1);
@@ -2167,9 +2181,13 @@ static void ggml_opengl_ssm_scan(gl_device_ctx & dev, ggml_tensor * dst) {
 static void ggml_opengl_conv_2d_dw(gl_device_ctx & dev, ggml_tensor * knl, ggml_tensor * src, ggml_tensor * dst) {
     std::vector<std::string> defines;
     if (knl->type == GGML_TYPE_F16) {
-        defines = { "KNL_F16" };
+        defines.push_back("KNL_F16");
     }
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw",
+    const bool cwhn = !ggml_is_contiguous(src);
+    if (cwhn) {
+        defines.push_back("CWHN");
+    }
+    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, cwhn ? (knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16_cwhn" : "conv_2d_dw_cwhn") : (knl->type == GGML_TYPE_F16 ? "conv_2d_dw_f16" : "conv_2d_dw"),
                                                       glsl_conv_2d_dw, defines);
 
     const gl_binding bk   = ggml_opengl_bind_tensor(dev, knl);
@@ -2198,7 +2216,7 @@ static bool ggml_opengl_unary_supported(ggml_unary_op op) {
         case GGML_UNARY_OP_GELU: case GGML_UNARY_OP_GELU_QUICK: case GGML_UNARY_OP_GELU_ERF: case GGML_UNARY_OP_SILU:
         case GGML_UNARY_OP_HARDSWISH: case GGML_UNARY_OP_HARDSIGMOID: case GGML_UNARY_OP_EXP: case GGML_UNARY_OP_SOFTPLUS:
         case GGML_UNARY_OP_EXPM1: case GGML_UNARY_OP_FLOOR: case GGML_UNARY_OP_CEIL: case GGML_UNARY_OP_ROUND:
-        case GGML_UNARY_OP_TRUNC:
+        case GGML_UNARY_OP_TRUNC: case GGML_UNARY_OP_XIELU:
             return true;
         default:
             return false;
@@ -2210,6 +2228,9 @@ static void ggml_opengl_unary(gl_device_ctx & dev, ggml_tensor * src, ggml_tenso
     const char *  op_define = dst->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(dst)) : ggml_op_name(dst->op);
     gl_pipeline & pipeline  = ggml_opengl_get_pipeline(dev, "unary", glsl_unary, { ggml_opengl_type_define(dst->type, "TYPE"), op_define });
     const bool    clamp     = dst->op == GGML_OP_CLAMP;
+    const bool    xielu     = dst->op == GGML_OP_UNARY && ggml_get_unary_op(dst) == GGML_UNARY_OP_XIELU;
+    const bool    leaky     = dst->op == GGML_OP_LEAKY_RELU;
+    const int     po        = xielu ? 1 : 0;   // XIELU keeps its four parameters at op_params 1..4
 
     const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
@@ -2220,8 +2241,10 @@ static void ggml_opengl_unary(gl_device_ctx & dev, ggml_tensor * src, ggml_tenso
         ne, bs.elem_offset, bd.elem_offset,
         (uint32_t) (src->nb[0] / ts), (uint32_t) (src->nb[1] / ts), (uint32_t) (src->nb[2] / ts), (uint32_t) (src->nb[3] / ts),
         (uint32_t) src->ne[0], (uint32_t) src->ne[1], (uint32_t) src->ne[2],
-        clamp ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 0)) : 0u,   // clamp min
-        clamp ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 1)) : 0u,   // clamp max
+        clamp || xielu || leaky ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, po)) : 0u,   // clamp min / slope
+        clamp || xielu ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, po + 1)) : 0u,   // clamp max
+        xielu ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 3)) : 0u,
+        xielu ? ggml_opengl_u32_from_f32(ggml_get_op_params_f32(dst, 4)) : 0u,
     };
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
@@ -3868,7 +3891,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             {
                 const int32_t mode_flags = ggml_get_op_params_i32(op, 0);
                 const int32_t mode       = mode_flags & 0xFF;
-                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && !(mode_flags & GGML_SCALE_FLAG_ANTIALIAS) &&
+                return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
                        (mode == GGML_SCALE_MODE_NEAREST || mode == GGML_SCALE_MODE_BILINEAR || mode == GGML_SCALE_MODE_BICUBIC);
             }
         case GGML_OP_POOL_1D:
@@ -3892,11 +3915,24 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 && ggml_is_contiguous(src1) && ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_CONV_2D_DW:
-            // only the WHCN path; the CWHN variant the CPU also handles has a different kernel layout
-            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                   (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(op) &&
-                   ggml_nelements(op) <= UINT32_MAX;
+            {
+                // WHCN (all contiguous) or CWHN (channels-last: element stride C, packed rows and batches, kernel [C, KW, KH])
+                const bool types_ok = op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                                      (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+                                      ggml_nelements(op) <= UINT32_MAX;
+                if (ggml_is_contiguous(src1)) {
+                    return types_ok && ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+                }
+                auto cwhn_packed = [](const ggml_tensor * t, int64_t c) {
+                    const size_t ts = ggml_type_size(t->type);
+                    return t->nb[2] == ts && t->nb[0] == c * ts && t->nb[1] == t->ne[0] * t->nb[0] &&
+                           (t->ne[3] == 1 || t->nb[3] == t->ne[1] * t->nb[1]);
+                };
+                const int64_t ch = src1->ne[2];
+                const size_t  ks = ggml_type_size(src0->type);
+                return types_ok && ggml_is_contiguous_channels(src1) && cwhn_packed(src1, ch) && cwhn_packed(op, ch) &&
+                       src0->ne[3] == ch && src0->nb[3] == ks && src0->nb[0] == ch * ks && src0->nb[1] == src0->ne[0] * src0->nb[0];
+            }
         case GGML_OP_SSM_SCAN:
             {
                 // one thread per (sequence, head, dim); the rows it indexes directly must be packed
@@ -3943,6 +3979,9 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                    src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
                    ggml_get_op_params_i32(op, 0) < src0->ne[0] && ggml_get_op_params_i32(op, 1) < src0->ne[0];
         case GGML_OP_LEAKY_RELU:
+            if (src0->type == GGML_TYPE_F16 && op->type == GGML_TYPE_F16) {
+                return ggml_is_contiguous(src0) && ggml_is_contiguous(op);   // unary.comp path
+            }
             return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
         case GGML_OP_SUM:
@@ -4042,8 +4081,8 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
                    ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_COL2IM_1D:
-            // f32 or f16 (16-bit access emulated); the CPU also takes bf16 columns
-            return op->type == src0->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) &&
+            // f32, f16 or bf16 (16-bit access emulated)
+            return op->type == src0->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
                    ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 0) > 0 &&
                    ggml_nelements(op) <= UINT32_MAX;
@@ -4118,7 +4157,11 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             }
         case GGML_OP_SET:
         case GGML_OP_ACC:
-            // the CPU asserts the same: src0 and dst are contiguous and the same shape
+            // the CPU asserts the same: src0 and dst are contiguous and the same shape; SET also takes i32 (raw copy)
+            if (op->op == GGML_OP_SET && src0->type == GGML_TYPE_I32 && src1->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32) {
+                return ggml_is_contiguous(src0) && ggml_is_contiguous(op) && ggml_are_same_shape(src0, op) &&
+                       src1->nb[0] == sizeof(int32_t);
+            }
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(op) && ggml_are_same_shape(src0, op) &&
                    src1->nb[0] == sizeof(float);
@@ -4222,8 +4265,8 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_IQ3_S || src0->type == GGML_TYPE_IQ2_S ||
                 src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS || src0->type == GGML_TYPE_IQ3_XXS ||
                 src0->type == GGML_TYPE_IQ1_S || src0->type == GGML_TYPE_IQ1_M || src0->type == GGML_TYPE_MXFP4 ||
-                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_Q1_0 || src0->type == GGML_TYPE_Q2_0 ||
-                src0->type == GGML_TYPE_NVFP4) {
+                src0->type == GGML_TYPE_TQ2_0 || src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_Q1_0 ||
+                src0->type == GGML_TYPE_Q2_0 || src0->type == GGML_TYPE_NVFP4) {
                 return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                        src0->nb[0] == ggml_type_size(src0->type) && src1->nb[0] == ggml_type_size(src1->type) &&
                        src0->ne[0] % ggml_blck_size(src0->type) == 0;
@@ -4242,7 +4285,7 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                 case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ1_S:
-                case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_TQ2_0: case GGML_TYPE_Q1_0:
+                case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4: case GGML_TYPE_TQ2_0: case GGML_TYPE_TQ1_0: case GGML_TYPE_Q1_0:
                 case GGML_TYPE_Q2_0: case GGML_TYPE_NVFP4:
                     return src0->ne[0] % ggml_blck_size(src0->type) == 0;
                 case GGML_TYPE_F32: case GGML_TYPE_F16: case GGML_TYPE_BF16:

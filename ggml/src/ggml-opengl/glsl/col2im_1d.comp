@@ -22,7 +22,23 @@ layout(std140, binding = 0) uniform Params {
     uint nwg_x;
 };
 
-#if defined(COL_F16)
+#if defined(COL_BF16)
+// bf16: the high half of an f32; f32 -> bf16 rounds to nearest even, NaN stays a quiet NaN (as the CPU)
+uint f32_to_bf16(float f) {
+    uint u = floatBitsToUint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) {
+        return (u >> 16) | 64u;
+    }
+    return (u + (0x7fffu + ((u >> 16) & 1u))) >> 16;
+}
+#define LOAD_COL(b, i)     uintBitsToFloat(((b[(i) >> 1] >> (((i) & 1u) * 16u)) & 0xFFFFu) << 16)
+#define STORE_COL(b, i, v) { \
+    uint _h  = f32_to_bf16(v); \
+    uint _sh = ((i) & 1u) * 16u; \
+    atomicAnd(b[(i) >> 1], ~(0xFFFFu << _sh)); \
+    atomicOr(b[(i) >> 1], _h << _sh); \
+}
+#elif defined(COL_F16)
 #define LOAD_COL(b, i)     LOAD_F16(b, i)
 #define STORE_COL(b, i, v) STORE_F16(b, i, v)
 #else
