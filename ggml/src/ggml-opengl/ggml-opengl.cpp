@@ -64,7 +64,18 @@ typedef unsigned int  GLbitfield;
 #include <vector>
 
 // Below 16 columns the matvec kernel is as fast or faster (measured for the D3D11 kernels, not for GL)
-#define GGML_GL_TILED_DEFAULT        16
+#ifndef GGML_GL_TILED_DEFAULT
+#define GGML_GL_TILED_DEFAULT        16   // exp352: build with -DGGML_GL_TILED_DEFAULT=N to A/B the threshold
+#endif
+#ifndef GGML_GL_TILED_MMID_DEFAULT
+#define GGML_GL_TILED_MMID_DEFAULT   16   // exp356: MUL_MAT_ID tiled gate (tokens), separate from the dense MUL_MAT gate; env GGML_OPENGL_TILED_MMID
+#endif
+#ifndef GGML_GL_MV_MULTI_DEFAULT
+#define GGML_GL_MV_MULTI_DEFAULT     1   // exp355: 1 = Q4_0 / Q8_0 word-window mat-vec for 2..15 columns (decode once, MAX_COLS accumulators); v0.1.0: on (exp357/364)
+#endif
+#ifndef GGML_GL_MV_COLS_DEFAULT
+#define GGML_GL_MV_COLS_DEFAULT      4   // exp351: build with -DGGML_GL_MV_COLS_DEFAULT=8 for 8-column mat-vec
+#endif
 #define GGML_GL_WG_SIZE              256
 #ifndef GGML_GL_MAX_TPR
 #define GGML_GL_MAX_TPR              GGML_GL_WG_SIZE   // matrix-vector threads per row cap (power of two)
@@ -339,8 +350,13 @@ struct gl_device_ctx {
     bool     ati_meminfo  = false;
     bool     nvx_meminfo  = false;
     uint32_t tiled_min_cols = GGML_GL_TILED_DEFAULT;
+    uint32_t tiled_mmid_min_cols = GGML_GL_TILED_MMID_DEFAULT;   // exp356
+    uint32_t tiled_type_cols[GGML_TYPE_COUNT] = {};   // exp364: dense tiled gate per weight type (device x type table in ggml_opengl_init_tiled_gates); 0 = tiled_min_cols
+    bool     mv_multi       = GGML_GL_MV_MULTI_DEFAULT != 0;   // exp355, env GGML_OPENGL_MV_MULTI
+    uint32_t tile_m         = 64;  // rows of dst per tiled-matmul workgroup (TILE_M in mul_mat_tiled.comp): 64, or 128 on AMD (exp343b: +3..11% pp on the R9700; Intel iGPU is faster at 64)
     uint32_t tiled_ksplit   = 0;   // tiles of k per tiled-matmul dispatch (1, 2, 4 or 8); 0 = one dispatch, loop in the shader
     uint32_t max_tpr        = GGML_GL_MAX_TPR;
+    uint32_t mv_cols        = GGML_GL_MV_COLS_DEFAULT;   // columns per mat-vec dispatch (4 or 8); GGML_OPENGL_MV_COLS (exp351)
     bool     no_fuse        = false;   // GGML_OPENGL_NO_FUSE: every node on its own
 
     GLuint   ubo       = 0;   // kernel parameters, one slot per dispatch, reused round robin
@@ -2819,11 +2835,14 @@ static void ggml_opengl_get_rows(gl_device_ctx & dev, ggml_tensor * src, ggml_te
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bi, bd }, CEIL_DIV(n_units, (uint32_t) GGML_GL_WG_SIZE));
 }
 
-// dst = src0 * src1 with a 64 x 32 tile of dst per workgroup; see mul_mat_tiled.comp
+// dst = src0 * src1 with a TILE_M x 32 tile of dst per workgroup; see mul_mat_tiled.comp
 static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst) {
     std::vector<std::string> defines = { ggml_opengl_type_define(src0->type, "SRC0") };
     if (src1->type == GGML_TYPE_F16) {
         defines.push_back("SRC1_F16");
+    }
+    if (dev.tile_m != 64) {
+        defines.push_back("TILE_M=" + std::to_string(dev.tile_m));
     }
 
     const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
@@ -2841,7 +2860,7 @@ static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, g
         (uint32_t) (dst->ne[2] * dst->ne[3]),
     };
     // tile sizes must match TILE_M and TILE_N in mul_mat_tiled.comp
-    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], 64u);
+    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], dev.tile_m);
     const uint32_t tiles_n = CEIL_DIV((uint32_t) dst->ne[1], 32u);
     const uint32_t batches = (uint32_t) (dst->ne[2] * dst->ne[3]);
     if (dev.tiled_ksplit == 0) {
@@ -2867,7 +2886,9 @@ static void ggml_opengl_mul_mat_tiled(gl_device_ctx & dev, ggml_tensor * src0, g
 
 // long prompts go to the tiled kernel; it needs k in whole tiles of 32
 static bool ggml_opengl_mul_mat_use_tiled(const gl_device_ctx & dev, const ggml_tensor * src0, const ggml_tensor * dst) {
-    return dev.tiled_min_cols != 0 && (uint32_t) dst->ne[1] >= dev.tiled_min_cols && src0->ne[0] % 32 == 0;
+    const uint32_t t_cols = (uint32_t) src0->type < (uint32_t) GGML_TYPE_COUNT ? dev.tiled_type_cols[src0->type] : 0;
+    const uint32_t gate   = t_cols != 0 ? t_cols : dev.tiled_min_cols;
+    return gate != 0 && (uint32_t) dst->ne[1] >= gate && src0->ne[0] % 32 == 0;
 }
 
 // with bias: MUL_MAT fused with the following ADD of one f32 row (mat-vec path only); dst is the ADD's output
@@ -2892,6 +2913,26 @@ static void ggml_opengl_mul_mat(gl_device_ctx & dev, ggml_tensor * src0, ggml_te
     if (bias) {
         defines.push_back("ADD_BIAS");
     }
+    if (dst->ne[1] == 1) {
+        defines.push_back("MAX_COLS=1");
+    }
+    // 5..8 columns in one dispatch: src0 is read once instead of once per group of 4 (exp351)
+    const uint32_t mv_step = dst->ne[1] > 4 && dev.mv_cols == 8 ? 8 : 4;
+    if (mv_step == 8) {
+        defines.push_back("MAX_COLS=8");
+    }
+    // single column, F32 src1 read as vec4s: needs 16-byte aligned columns (Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K src0 only)
+    // exp355: 2..15 columns of Q4_0 / Q8_0 take the same word-window kernel with MAX_COLS = 4 accumulators
+    const bool one_col_type = dst->ne[1] == 1 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0 ||
+         src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K || src0->type == GGML_TYPE_Q6_K);
+    const bool multi_type   = dev.mv_multi && dst->ne[1] > 1 && mv_step == 4 && (src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0);
+    if ((one_col_type || multi_type) && src1->type == GGML_TYPE_F32 &&
+        src0->ne[0] % 32 == 0 && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0) {
+        const gl_binding b1a = ggml_opengl_bind_tensor(dev, src1);
+        if (b1a.offset % 16 == 0 && b1a.elem_offset % 4 == 0) {
+            defines.push_back("ONE_COL");
+        }
+    }
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_vec", glsl_mul_mat_vec, defines);
 
     const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
@@ -2915,8 +2956,8 @@ static void ggml_opengl_mul_mat(gl_device_ctx & dev, ggml_tensor * src0, ggml_te
     }
     const size_t   col0_idx = 10;
     const uint32_t total_wg = CEIL_DIV((uint32_t) dst->ne[0], GGML_GL_WG_SIZE / tpr) * (uint32_t) (dst->ne[2] * dst->ne[3]);
-    // columns are processed 4 at a time (MAX_COLS in mul_mat_vec.comp); every chunk re-reads src0
-    for (uint32_t col0 = 0; col0 < (uint32_t) dst->ne[1]; col0 += 4) {
+    // columns are processed mv_step (4 or 8, MAX_COLS in mul_mat_vec.comp) at a time; every chunk re-reads src0
+    for (uint32_t col0 = 0; col0 < (uint32_t) dst->ne[1]; col0 += mv_step) {
         params[col0_idx] = col0;
         if (bias) {
             ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd, bb }, total_wg);
@@ -2935,7 +2976,7 @@ static bool ggml_opengl_mul_mat_id_tiled(gl_device_ctx & dev, ggml_tensor * as, 
     const uint32_t n_tokens  = (uint32_t) ids->ne[1];
     const uint32_t n_experts = (uint32_t) as->ne[2];
     // MAX_EXPERTS in mul_mat_id_prep.comp
-    if (dev.tiled_min_cols == 0 || dev.tiled_ksplit != 0 || n_tokens < dev.tiled_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
+    if (dev.tiled_mmid_min_cols == 0 || dev.tiled_ksplit != 0 || n_tokens < dev.tiled_mmid_min_cols || n_experts > 1024 || as->ne[3] != 1 ||
         as->ne[0] % 32 != 0 || src1->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float)) {
         return false;
     }
@@ -2966,7 +3007,8 @@ static bool ggml_opengl_mul_mat_id_tiled(gl_device_ctx & dev, ggml_tensor * as, 
                          { bi, bs }, 1);
 
     gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "mul_mat_tiled", glsl_mul_mat_tiled,
-                                                      { ggml_opengl_type_define(as->type, "SRC0"), "MMID" });
+                                                      dev.tile_m != 64 ? std::vector<std::string>{ ggml_opengl_type_define(as->type, "SRC0"), "MMID", "TILE_M=" + std::to_string(dev.tile_m) }
+                                                                                : std::vector<std::string>{ ggml_opengl_type_define(as->type, "SRC0"), "MMID" });
     const gl_binding b0 = ggml_opengl_bind_tensor(dev, as);
     const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
     const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
@@ -2981,7 +3023,7 @@ static bool ggml_opengl_mul_mat_id_tiled(gl_device_ctx & dev, ggml_tensor * as, 
         n_used, (uint32_t) src1->ne[1], (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), list_base,
     };
     // TILE_M in mul_mat_tiled.comp; workgroups past the real tile count do nothing
-    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], 64u);
+    const uint32_t tiles_m = CEIL_DIV((uint32_t) dst->ne[0], dev.tile_m);
     ggml_opengl_dispatch(dev, pipeline, params, { b1, b0, bd, bs }, tiles_m * max_tiles);
     return true;
 }
@@ -4552,6 +4594,12 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     if (dev.desc.find("Moore Threads") != std::string::npos) {
         dev.tiled_ksplit = 4;
     }
+    if (dev.desc.find("AMD") != std::string::npos || dev.desc.find("Radeon") != std::string::npos) {
+        dev.tile_m = 128;
+    }
+    if (const char * env = ggml_opengl_getenv("TILE_M")) {
+        dev.tile_m = atoi(env) == 128 ? 128u : 64u;
+    }
 
     std::map<std::string, bool> exts;
     GLint n_ext = 0;
@@ -4608,6 +4656,33 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     }
     if (const char * env = ggml_opengl_getenv("TILED")) {
         dev.tiled_min_cols = (uint32_t) std::max(0, atoi(env));
+        dev.tiled_mmid_min_cols = dev.tiled_min_cols;   // as before exp356: one switch for both gates
+    }
+    if (const char * env = ggml_opengl_getenv("MV_MULTI")) {
+        dev.mv_multi = atoi(env) != 0;
+    }
+    // exp364: dense tiled gate per device x weight type, from the exp352/353/356/357/358 llama-bench sweeps (t/s, n = columns).
+    // GGML_OPENGL_TILED (any value) switches the table off and sets one gate for every type as before.
+    // Intel Iris Xe: tiled wins from 5 columns for Q4_0, Q8_0, Q4_K, Q6_K (granite +41..66%, LFM x8..17).
+    // AMD (R9700): Q6_K and Q8_0 win from 5; with the multi-column mat-vec on Q8_0 crosses at 16 and Q4_0 only at ~40 (exp357);
+    // Q4_0 and Q4_K without it lose to the mat-vec up to 15 columns. Other types keep the default gate (not measured).
+    if (!ggml_opengl_getenv("TILED")) {
+        const bool intel = dev.desc.find("Intel") != std::string::npos;
+        const bool amd   = dev.desc.find("AMD") != std::string::npos || dev.desc.find("Radeon") != std::string::npos;
+        if (intel) {
+            for (ggml_type t : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+                dev.tiled_type_cols[t] = 5;
+            }
+        } else if (amd) {
+            dev.tiled_type_cols[GGML_TYPE_Q6_K] = 5;
+            dev.tiled_type_cols[GGML_TYPE_Q8_0] = dev.mv_multi ? 16 : 5;
+            if (dev.mv_multi) {
+                dev.tiled_type_cols[GGML_TYPE_Q4_0] = 40;
+            }
+        }
+    }
+    if (const char * env = ggml_opengl_getenv("TILED_MMID")) {
+        dev.tiled_mmid_min_cols = (uint32_t) std::max(0, atoi(env));
     }
     if (const char * env = ggml_opengl_getenv("KSPLIT")) {
         const int v = atoi(env);
@@ -4615,6 +4690,9 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
     }
     if (const char * env = ggml_opengl_getenv("NO_FUSE")) {
         dev.no_fuse = atoi(env) != 0;
+    }
+    if (const char * env = ggml_opengl_getenv("MV_COLS")) {
+        dev.mv_cols = atoi(env) == 8 ? 8 : 4;
     }
     if (const char * env = ggml_opengl_getenv("MAX_TPR")) {
         // power of two in 1..WG_SIZE
@@ -4666,9 +4744,11 @@ static bool ggml_opengl_init_device(gl_device_ctx & dev, ggml_backend_dev_t ggml
         /* .iface = */ {
             /* .get_name       = */ ggml_backend_opengl_buffer_type_get_name,
             /* .alloc_buffer   = */ ggml_backend_opengl_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n = */ NULL,
             /* .get_alignment  = */ ggml_backend_opengl_buffer_type_get_alignment,
             /* .get_max_size   = */ ggml_backend_opengl_buffer_type_get_max_size,
             /* .get_alloc_size = */ NULL,
+            /* .get_alloc_size_n = */ NULL,
             /* .is_host        = */ NULL,
         },
         /* .device  = */ ggml_dev,
