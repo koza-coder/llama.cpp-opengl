@@ -4,6 +4,7 @@
 > It runs LLMs on Windows GPUs through their OpenGL driver, including GPUs without Vulkan, CUDA or ROCm support.
 >
 > - **Download:** Windows x64 zips on the [releases page](https://github.com/koza-coder/llama.cpp-opengl/releases)
+> - **Tested** (v0.1.0 zip): AMD Radeon AI PRO R9700 with Qwen2.5-0.5B Q4_0: prompt pp512 5947 tok/s, generation tg64 131 tok/s, perplexity 17.29
 > - **Build, test, settings:** [docs/backend/OPENGL.md](docs/backend/OPENGL.md)
 > - **Backend source:** [ggml/src/ggml-opengl](ggml/src/ggml-opengl)
 >
