@@ -11,13 +11,20 @@
 //          SRC0_{F32,F16,BF16,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,IQ4_NL,IQ4_XS,IQ3_S,IQ2_S,IQ2_XXS,IQ2_XS,IQ3_XXS,IQ1_S,IQ1_M,MXFP4,TQ2_0,Q1_0,Q2_0}, TPR (power of two, 1..WG_SIZE), SRC1_F16 (f16 columns instead of f32)
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
-#define MAX_COLS 4
+#ifndef MAX_COLS
+#define MAX_COLS 4   // MAX_COLS=1 is passed by the host for a single column (token generation)
+#endif
 
 #define ROWS (WG_SIZE / TPR)
 
 layout(local_size_x = WG_SIZE) in;
 
+#if defined(ONE_COL)
+// single column, F32 src1, Q4_0/Q8_0 src0 (host checks the 16-byte alignment): src1 as vec4s like the D3D11 Load4 path
+layout(std430, binding = 0) buffer Src1 { vec4 src1v[]; };
+#else
 layout(std430, binding = 0) buffer Src1 { uint src1[]; };
+#endif
 layout(std430, binding = 1) buffer Src0 { uint src0[]; };
 layout(std430, binding = 2) buffer Dst  { uint dst[]; };
 #if defined(MMID)
@@ -63,6 +70,7 @@ layout(std140, binding = 0) uniform Params {
 shared float partial[MAX_COLS][WG_SIZE];
 #endif
 
+#if !defined(ONE_COL)
 #if defined(SRC1_F16)
 float load_src1(uint i) {
     uint bits;
@@ -73,6 +81,7 @@ float load_src1(uint i) {
 float load_src1(uint i) {
     return LOAD_F32(src1, i);
 }
+#endif
 #endif
 
 // byte b (0..3) of a word
@@ -131,7 +140,7 @@ void main() {
     uint src0_base = offset_src0 + src03_idx * stride_03 + src02_idx * stride_02 + row * stride_01;
     uint src1_base[MAX_COLS];
     for (uint c = 0u; c < uint(MAX_COLS); c++) {
-        src1_base[c] = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12 + (col0 + c) * stride_11;
+        src1_base[c] = offset_src1 + dst3_idx * stride_13 + dst2_idx * stride_12 + min(col0 + c, n - 1u) * stride_11;
     }
 #endif
     float acc[MAX_COLS];
@@ -140,7 +149,165 @@ void main() {
     }
 
     if (wg_ok && row < m) {
-#if defined(SRC0_Q4_0)
+#if defined(ONE_COL) && defined(SRC0_Q4_0)
+        // single column (or MAX_COLS columns, exp355): the 18-byte block as one 20-byte window of words and src1 in
+        // vec4s (port of the D3D11 ONE_COL path). Blocks start on 2 bytes: odd = the block starts at byte 2 of the window.
+        // Each weight word is decoded once and used for every column.
+        for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
+            uint base = (src0_base + blk) * 18u;
+            uint w0   = base >> 2;
+            bool odd  = (base & 2u) != 0u;
+            uint W[5] = uint[5](src0[w0], src0[w0 + 1u], src0[w0 + 2u], src0[w0 + 3u], src0[w0 + 4u]);
+            float d   = f16_to_f32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+            float sum[MAX_COLS];
+            for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                sum[c] = 0.0;
+            }
+            for (uint j = 0u; j < 4u; j++) {
+                uint q    = odd ? W[j + 1u] : ((W[j] >> 16) | (W[j + 1u] << 16));
+                float v0  = float(q & 0xFu) - 8.0;
+                float v1  = float((q >> 8) & 0xFu) - 8.0;
+                float v2  = float((q >> 16) & 0xFu) - 8.0;
+                float v3  = float((q >> 24) & 0xFu) - 8.0;
+                float v4  = float((q >> 4) & 0xFu) - 8.0;
+                float v5  = float((q >> 12) & 0xFu) - 8.0;
+                float v6  = float((q >> 20) & 0xFu) - 8.0;
+                float v7  = float(q >> 28) - 8.0;
+                for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                    uint ys  = (src1_base[c] >> 2) + blk * 8u;
+                    vec4 ylo = src1v[ys + j];
+                    vec4 yhi = src1v[ys + 4u + j];
+                    sum[c] += v0 * ylo.x + v1 * ylo.y + v2 * ylo.z + v3 * ylo.w +
+                              v4 * yhi.x + v5 * yhi.y + v6 * yhi.z + v7 * yhi.w;
+                }
+            }
+            for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                acc[c] += sum[c] * d;
+            }
+        }
+#elif defined(ONE_COL) && defined(SRC0_Q8_0)
+        // single column (or MAX_COLS columns, exp355): the 34-byte block as one 36-byte window of words and src1 in vec4s
+        for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
+            uint base = (src0_base + blk) * 34u;
+            uint w0   = base >> 2;
+            bool odd  = (base & 2u) != 0u;
+            uint W[9] = uint[9](src0[w0], src0[w0 + 1u], src0[w0 + 2u], src0[w0 + 3u], src0[w0 + 4u], src0[w0 + 5u],
+                                src0[w0 + 6u], src0[w0 + 7u], src0[w0 + 8u]);
+            float d   = f16_to_f32(odd ? (W[0] >> 16) : (W[0] & 0xFFFFu));
+            float sum[MAX_COLS];
+            for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                sum[c] = 0.0;
+            }
+            for (uint j = 0u; j < 8u; j++) {
+                uint q   = odd ? W[j + 1u] : ((W[j] >> 16) | (W[j + 1u] << 16));
+                float v0 = float(SBYTE_OF(q, 0u));
+                float v1 = float(SBYTE_OF(q, 1u));
+                float v2 = float(SBYTE_OF(q, 2u));
+                float v3 = float(SBYTE_OF(q, 3u));
+                for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                    vec4 y = src1v[(src1_base[c] >> 2) + blk * 8u + j];
+                    sum[c] += v0 * y.x + v1 * y.y + v2 * y.z + v3 * y.w;
+                }
+            }
+            for (uint c = 0u; c < uint(MAX_COLS); c++) {
+                acc[c] += sum[c] * d;
+            }
+        }
+#elif defined(ONE_COL) && (defined(SRC0_Q4_K) || defined(SRC0_Q5_K))
+        // single column (port of the D3D11 ONE_COL paths): header, qh (Q5_K) and the 32 nibble bytes of the sub-block as
+        // words, src1 in vec4s. 144 / 176-byte blocks are whole words.
+        for (uint sb = lane; sb < k / 32u; sb += uint(TPR)) {
+            uint blk  = sb / 8u;
+            uint s    = sb % 8u;
+#if defined(SRC0_Q4_K)
+            uint w    = (src0_base + blk) * 36u;
+#else
+            uint w    = (src0_base + blk) * 44u;
+#endif
+            uint hd0  = src0[w];
+            uint hdy  = src0[w + 1u];
+            uint hdz  = src0[w + 2u];
+            uint hdw  = src0[w + 3u];
+            float d    = f16_to_f32(hd0 & 0xFFFFu);
+            float dmin = f16_to_f32(hd0 >> 16);
+            uint sc, mn;
+            if (s < 4u) {
+                sc = BYTE_OF(hdy, s) & 63u;
+                mn = BYTE_OF(hdz, s) & 63u;
+            } else {
+                sc = (BYTE_OF(hdw, s - 4u) & 0xFu) | ((BYTE_OF(hdy, s - 4u) >> 6) << 4);
+                mn = (BYTE_OF(hdw, s - 4u) >> 4) | ((BYTE_OF(hdz, s - 4u) >> 6) << 4);
+            }
+            uint shift = (s & 1u) * 4u;
+#if defined(SRC0_Q4_K)
+            uint qw   = w + 4u + 8u * (s / 2u);
+#else
+            uint qw   = w + 12u + 8u * (s / 2u);
+            uint H[8] = uint[8](src0[w + 4u], src0[w + 5u], src0[w + 6u], src0[w + 7u], src0[w + 8u], src0[w + 9u],
+                                src0[w + 10u], src0[w + 11u]);
+#endif
+            uint Q[8] = uint[8](src0[qw], src0[qw + 1u], src0[qw + 2u], src0[qw + 3u], src0[qw + 4u], src0[qw + 5u],
+                                src0[qw + 6u], src0[qw + 7u]);
+            uint ys   = (src1_base[0] >> 2) + blk * 64u + s * 8u;
+            float sq = 0.0, sy = 0.0;
+            for (uint j = 0u; j < 8u; j++) {
+                vec4 y = src1v[ys + j];
+#if defined(SRC0_Q4_K)
+                uint q = Q[j] >> shift;
+                sq += float(q & 0xFu) * y.x + float((q >> 8) & 0xFu) * y.y +
+                      float((q >> 16) & 0xFu) * y.z + float((q >> 24) & 0xFu) * y.w;
+#else
+                uint q = (Q[j] >> shift) & 0x0F0F0F0Fu;
+                uint hb = ((H[j] >> s) & 0x01010101u) << 4;   // bit s of each qh byte -> +16
+                uint v = q | hb;
+                sq += float(v & 0xFFu) * y.x + float((v >> 8) & 0xFFu) * y.y +
+                      float((v >> 16) & 0xFFu) * y.z + float(v >> 24) * y.w;
+#endif
+                sy += y.x + y.y + y.z + y.w;
+            }
+            acc[0] += d * float(sc) * sq - dmin * float(mn) * sy;
+        }
+#elif defined(ONE_COL) && defined(SRC0_Q6_K)
+        // single column: ql and qh as 36-byte windows of words (210-byte blocks start on 2 bytes), src1 in vec4s
+        for (uint sb = lane; sb < k / 32u; sb += uint(TPR)) {
+            uint blk  = sb / 8u;
+            uint s    = sb % 8u;
+            uint h    = s / 4u;
+            uint t    = s % 4u;
+            uint base = (src0_base + blk) * 210u;
+            uint dbits;
+            LOAD_U16_UNALIGNED(src0, base + 208u, dbits);
+            float d = f16_to_f32(dbits);
+            uint ql_base = base + 64u * h + 32u * (t & 1u);
+            uint qh_base = base + 128u + 32u * h;
+            uint sc_base = base + 192u + 8u * h + 2u * t;
+            uint lshift  = (t >> 1) * 4u;
+            uint hshift  = t * 2u;
+            uint scw;
+            LOAD_U32_UNALIGNED(src0, sc_base, scw);
+            bool odd = (base & 2u) != 0u;   // ql_base and qh_base share base's 4-byte phase
+            uint la  = ql_base >> 2;
+            uint ha  = qh_base >> 2;
+            uint L[9] = uint[9](src0[la], src0[la + 1u], src0[la + 2u], src0[la + 3u], src0[la + 4u], src0[la + 5u],
+                                src0[la + 6u], src0[la + 7u], src0[la + 8u]);
+            uint H[9] = uint[9](src0[ha], src0[ha + 1u], src0[ha + 2u], src0[ha + 3u], src0[ha + 4u], src0[ha + 5u],
+                                src0[ha + 6u], src0[ha + 7u], src0[ha + 8u]);
+            uint ys   = (src1_base[0] >> 2) + blk * 64u + s * 8u;
+            float sum0 = 0.0, sum1 = 0.0;
+            for (uint j = 0u; j < 8u; j++) {
+                uint ql = odd ? ((L[j] >> 16) | (L[j + 1u] << 16)) : L[j];
+                uint qh = odd ? ((H[j] >> 16) | (H[j + 1u] << 16)) : H[j];
+                vec4 y  = src1v[ys + j];
+                float p = 0.0;
+                for (uint b = 0u; b < 4u; b++) {
+                    int q = int(((BYTE_OF(ql, b) >> lshift) & 0xFu) | (((BYTE_OF(qh, b) >> hshift) & 3u) << 4)) - 32;
+                    p += float(q) * y[b];
+                }
+                if (j < 4u) { sum0 += p; } else { sum1 += p; }
+            }
+            acc[0] += d * (float(SBYTE_OF(scw, 0u)) * sum0 + float(SBYTE_OF(scw, 1u)) * sum1);
+        }
+#elif defined(SRC0_Q4_0)
         // block (18 bytes): f16 d, 16 bytes of nibbles; low nibbles are elements 0..15, high nibbles 16..31
         for (uint blk = lane; blk < k / 32u; blk += uint(TPR)) {
             uint base = (src0_base + blk) * 18u;
@@ -792,7 +959,11 @@ void main() {
 #endif
     }
 
+#if MAX_COLS > 4
+    float row_result[MAX_COLS];
+#else
     vec4 row_result;
+#endif
 #if TPR > 1
     // tree reduction inside each TPR block
     for (uint c = 0u; c < uint(MAX_COLS); c++) {
@@ -809,10 +980,26 @@ void main() {
         memoryBarrierShared();
         barrier();
     }
+#if MAX_COLS > 4
+    for (uint c = 0u; c < uint(MAX_COLS); c++) {
+        row_result[c] = partial[c][tid];
+    }
+#elif MAX_COLS == 1
+    row_result = vec4(partial[0][tid], 0.0, 0.0, 0.0);
+#else
     row_result = vec4(partial[0][tid], partial[1][tid], partial[2][tid], partial[3][tid]);
+#endif
 #else
     // one thread per row: no shared memory and no barriers
+#if MAX_COLS > 4
+    for (uint c = 0u; c < uint(MAX_COLS); c++) {
+        row_result[c] = acc[c];
+    }
+#elif MAX_COLS == 1
+    row_result = vec4(acc[0], 0.0, 0.0, 0.0);
+#else
     row_result = vec4(acc[0], acc[1], acc[2], acc[3]);
+#endif
 #endif
 
 #if defined(MMID)

@@ -15,7 +15,9 @@
 // and each pass after the first adds to dst.
 // src0 offsets/strides are in elements for float types and in blocks for quant types.
 
+#ifndef TILE_M
 #define TILE_M 64
+#endif
 #define TILE_N 32
 #define TILE_K 32
 
@@ -701,10 +703,146 @@ void load_a_row(uint row_base, uint k0, uint col) {
 #endif
 }
 
+#if defined(SRC0_F32) || defined(SRC0_F16) || defined(SRC0_Q8_0) || defined(SRC0_Q4_0) || defined(SRC0_Q4_K) || defined(SRC0_Q6_K)
+// A_STAGE4: all 256 threads stage the A tile, NTHREADS / TILE_M threads per src0 row, 8 values each (instead of
+// TILE_M threads doing a whole row alone while the others wait at the barrier)
+#define A_STAGE4
+#define A_PER_ROW (NTHREADS / TILE_M)
+#if A_PER_ROW * TILE_M != NTHREADS || (A_PER_ROW != 1 && A_PER_ROW != 2 && A_PER_ROW != 4)
+#error A_STAGE4 needs NTHREADS / TILE_M to be 1, 2 or 4
+#endif
+
+// element index inside the 32-value block of value i (0..7) of part p (0..3)
+uint a_elem(uint p, uint i) {
+#if defined(SRC0_Q4_0)
+    return (i < 4u) ? (p * 4u + i) : (16u + p * 4u + (i - 4u));
+#else
+    return p * 8u + i;
+#endif
+}
+
+void load_a_part(uint row_base, uint k0, uint p, out float v[8]) {
+#if defined(SRC0_F32)
+    for (uint i = 0u; i < 8u; i++) {
+        v[i] = uintBitsToFloat(src0[row_base + k0 + p * 8u + i]);
+    }
+#elif defined(SRC0_F16)
+    for (uint i = 0u; i < 8u; i += 2u) {
+        uint w;
+        LOAD_U32_UNALIGNED(src0, (row_base + k0 + p * 8u + i) * 2u, w);
+        v[i]      = f16_to_f32(w);
+        v[i + 1u] = f16_to_f32(w >> 16);
+    }
+#elif defined(SRC0_Q8_0)
+    uint base = (row_base + k0 / 32u) * 34u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    float d = f16_to_f32(dbits);
+    for (uint j = 0u; j < 2u; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, base + 2u + 8u * p + 4u * j, q);
+        for (uint b = 0u; b < 4u; b++) {
+            v[j * 4u + b] = float(SBYTE_OF(q, b)) * d;
+        }
+    }
+#elif defined(SRC0_Q4_0)
+    uint base = (row_base + k0 / 32u) * 18u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base, dbits);
+    float d = f16_to_f32(dbits);
+    uint q;
+    LOAD_U32_UNALIGNED(src0, base + 2u + 4u * p, q);
+    for (uint b = 0u; b < 4u; b++) {
+        uint byte_v = BYTE_OF(q, b);
+        v[b]      = (float(byte_v & 0xFu) - 8.0) * d;
+        v[4u + b] = (float(byte_v >> 4) - 8.0) * d;
+    }
+#elif defined(SRC0_Q4_K)
+    // same sub-block decode as load_a_row; part p covers elements p*8..p*8+7, i.e. 4-byte groups 2p and 2p+1
+    uint blk  = k0 / 256u;
+    uint sb   = (k0 % 256u) / 32u;
+    uint base = (row_base + blk) * 144u;
+    uint w;
+    LOAD_U32_UNALIGNED(src0, base, w);
+    float d    = f16_to_f32(w);
+    float dmin = f16_to_f32(w >> 16);
+    uint sc0, sc1, sc2;
+    LOAD_U32_UNALIGNED(src0, base + 4u, sc0);
+    LOAD_U32_UNALIGNED(src0, base + 8u, sc1);
+    LOAD_U32_UNALIGNED(src0, base + 12u, sc2);
+    uint sc, mn;
+    if (sb < 4u) {
+        sc = BYTE_OF(sc0, sb) & 63u;
+        mn = BYTE_OF(sc1, sb) & 63u;
+    } else {
+        sc = (BYTE_OF(sc2, sb - 4u) & 0xFu) | ((BYTE_OF(sc0, sb - 4u) >> 6) << 4);
+        mn = (BYTE_OF(sc2, sb - 4u) >> 4) | ((BYTE_OF(sc1, sb - 4u) >> 6) << 4);
+    }
+    float dl    = d * float(sc);
+    float ml    = dmin * float(mn);
+    uint  shift = (sb & 1u) * 4u;
+    uint  qbase = base + 16u + 32u * (sb / 2u) + 8u * p;
+    for (uint j = 0u; j < 2u; j++) {
+        uint q;
+        LOAD_U32_UNALIGNED(src0, qbase + 4u * j, q);
+        for (uint b = 0u; b < 4u; b++) {
+            v[j * 4u + b] = dl * float((BYTE_OF(q, b) >> shift) & 0xFu) - ml;
+        }
+    }
+#elif defined(SRC0_Q6_K)
+    uint blk  = k0 / 256u;
+    uint sb   = (k0 % 256u) / 32u;
+    uint h    = sb / 4u;
+    uint t    = sb % 4u;
+    uint base = (row_base + blk) * 210u;
+    uint dbits;
+    LOAD_U16_UNALIGNED(src0, base + 208u, dbits);
+    float d       = f16_to_f32(dbits);
+    uint  ql_base = base + 64u * h + 32u * (t & 1u) + 8u * p;
+    uint  qh_base = base + 128u + 32u * h + 8u * p;
+    uint  sc_base = base + 192u + 8u * h + 2u * t;
+    uint  lshift  = (t >> 1) * 4u;
+    uint  hshift  = t * 2u;
+    uint scw;
+    LOAD_U32_UNALIGNED(src0, sc_base, scw);
+    float dsc = d * float(SBYTE_OF(scw, (p < 2u) ? 0u : 1u));
+    for (uint j = 0u; j < 2u; j++) {
+        uint ql, qh;
+        LOAD_U32_UNALIGNED(src0, ql_base + 4u * j, ql);
+        LOAD_U32_UNALIGNED(src0, qh_base + 4u * j, qh);
+        for (uint b = 0u; b < 4u; b++) {
+            int q = int(((BYTE_OF(ql, b) >> lshift) & 0xFu) | (((BYTE_OF(qh, b) >> hshift) & 3u) << 4)) - 32;
+            v[j * 4u + b] = dsc * float(q);
+        }
+    }
+#endif
+}
+#endif
+
 // one TILE_K step of k at kt: stage both tiles, then accumulate into acc
 float acc[REG_M][REG_N];
 
 void k_step(uint kt, uint tid, uint tx, uint ty, uint row0, uint a_batch, bool b_ok, uint b_base, uint b_part, uint b_col) {
+#if defined(A_STAGE4)
+    {
+        uint ar = tid / uint(A_PER_ROW);
+        uint r  = row0 + ar;
+        for (uint ps = 0u; ps < 4u / uint(A_PER_ROW); ps++) {
+            uint ap = tid % uint(A_PER_ROW) + ps * uint(A_PER_ROW);
+            float v[8];
+            if (r < m) {
+                load_a_part(a_batch + r * stride_01, kt, ap, v);
+            } else {
+                for (uint z = 0u; z < 8u; z++) {
+                    v[z] = 0.0;
+                }
+            }
+            for (uint zi = 0u; zi < 8u; zi++) {
+                Atile[a_elem(ap, zi)][ar] = v[zi];
+            }
+        }
+    }
+#else
     if (tid < uint(TILE_M)) {
         uint r = row0 + tid;
         if (r < m) {
@@ -715,6 +853,7 @@ void k_step(uint kt, uint tid, uint tx, uint ty, uint row0, uint a_batch, bool b
             }
         }
     }
+#endif
     for (uint i = 0u; i < 4u; i++) {
         uint ki = b_part * 4u + i;
         Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0;
