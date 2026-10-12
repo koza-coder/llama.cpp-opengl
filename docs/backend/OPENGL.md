@@ -10,13 +10,18 @@ driver offers an OpenGL 4.3 (or newer) core context, including GPUs without Vulk
 
 ## Status
 
-Tested with release v0.0.7:
+Tested with release v0.1.0 (R9700) and earlier releases (the other GPUs; the release is named in each row). Speeds are
+`llama-bench` tokens per second, mean of 2 runs, qwen2.5-0.5b q4_0; pp512 = reading a 512-token prompt, tg64 = writing 64 tokens.
 
-| GPU | Result |
-|---|---|
-| AMD Radeon AI PRO R9700 | every exe in the zip runs; the 40 new ops and MUL_MAT 5687/5687 in `test-backend-ops`; qwen2.5-0.5b q4_0 PPL 17.29, pp512 7018 / tg64 116 tok/s; SmolVLM-500M (image) correct |
-| Intel Iris Xe | every exe in the zip runs; qwen2.5-0.5b q4_0 PPL 17.29, pp512 328 / tg64 6.8 tok/s; SmolVLM-500M (image) correct |
-| Moore Threads MTT S80 | not tested since v0.0.5 (offline); v0.0.5: qwen2.5-0.5b q4_0 PPL 17.29, pp512 788 / tg64 31 tok/s |
+| GPU | Release | Result |
+|---|---|---|
+| AMD Radeon AI PRO R9700 | v0.1.0 | every exe in the zip runs (0 failed runs); qwen2.5-0.5b q4_0 PPL 17.29, pp512 5947 (+/- 844) / tg64 131.2 tok/s; Bonsai-8B Q1_0 PPL 12.41; MUL_MAT Q4_0 118/118, Q8_0 113/113, Q6_K 62/62 and MUL_MAT_ID 945/945 in `test-backend-ops` (candidate build, same source) |
+| Intel Iris Xe | v0.0.7 | every exe in the zip runs; qwen2.5-0.5b q4_0 PPL 17.29, pp512 328 / tg64 6.8 tok/s; SmolVLM-500M (image) correct. v0.1.0 raises tg64 to 11.3 tok/s (qwen2.5-0.5b Q4_0, measured on a build with the same source, not the zip) |
+| Moore Threads MTT S80 | v0.0.5 | not tested since v0.0.5 (offline); qwen2.5-0.5b q4_0 PPL 17.29, pp512 788 / tg64 31 tok/s |
+
+Short prompts (2 to 15 tokens) are much faster since v0.1.0 (prompt tokens per second, before -> after): R9700 qwen2.5-0.5b
+Q4_0 pp4 204 -> 354 and pp15 357 -> 752; Intel Iris Xe qwen2.5-0.5b Q4_0 pp4 12.4 -> 41.3. Prompts of 16 tokens and longer
+are unchanged on both GPUs, except the type-specific gate listed in the release notes.
 
 Ops the backend does not support run on the CPU (the ggml scheduler does this automatically). The authoritative list
 of supported ops and types is `ggml_backend_opengl_device_supports_op` in `ggml-opengl.cpp`.
@@ -76,7 +81,10 @@ Compares every supported op against the CPU backend. `-o MUL_MAT` (or any op nam
 | Variable | Effect |
 |---|---|
 | `GGML_OPENGL_NO_SHADER_CACHE` | do not read or write the compiled shader cache (`opengl-shader-cache` next to the exe) |
-| `GGML_OPENGL_TILED=<n>` | use the tiled matmul from `n` columns up (0 = off); default 16 |
+| `GGML_OPENGL_TILED=<n>` | use the tiled matmul from `n` columns up (0 = off). Default: 16, except Intel (5 columns for Q4_0, Q8_0, Q4_K, Q6_K) and AMD (5 columns for Q6_K, 40 for Q4_0); setting it switches that table off |
+| `GGML_OPENGL_TILED_MMID=<n>` | the same for mixture-of-experts layers (default 16) |
+| `GGML_OPENGL_TILE_M=<n>` | rows per tile of the tiled matmul (64 or 128; default 128 on AMD, 64 elsewhere) |
+| `GGML_OPENGL_MV_MULTI=0` | turn off the multi-column mat-vec for 2 to 15 prompt tokens (Q4_0, Q8_0) |
 | `GGML_OPENGL_KSPLIT=<n>` | run the tiled matmul's k loop as one dispatch per `n` tiles (1, 2, 4 or 8; other values = off, one dispatch). Default 4 on Moore Threads, whose shader compiler rejects a barrier inside a loop; off elsewhere |
 | `GGML_OPENGL_MAX_ALLOC_MB=<n>` | cap the size of one GPU buffer |
 | `GGML_OPENGL_STATS` | print counters (graphs, dispatches, barriers, graph time, shader compiles vs. cache hits, transfers) |
