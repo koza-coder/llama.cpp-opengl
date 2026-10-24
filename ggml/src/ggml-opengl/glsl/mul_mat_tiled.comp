@@ -95,15 +95,29 @@ float load_src1(uint i) {
 void load_a_row(uint row_base, uint k0, uint col) {
 #if defined(SRC0_F32)
     for (uint i = 0u; i < uint(TILE_K); i++) {
+#if defined(K_TAIL)
+        Atile[i][col] = (k0 + i < k) ? uintBitsToFloat(src0[row_base + k0 + i]) : 0.0;
+#else
         Atile[i][col] = uintBitsToFloat(src0[row_base + k0 + i]);
+#endif
     }
 #elif defined(SRC0_F16)
+#if defined(K_TAIL)
+    for (uint i = 0u; i < uint(TILE_K); i++) {
+        uint bits = 0u;
+        if (k0 + i < k) {
+            LOAD_U16_UNALIGNED(src0, (row_base + k0 + i) * 2u, bits);
+        }
+        Atile[i][col] = f16_to_f32(bits);
+    }
+#else
     for (uint i = 0u; i < uint(TILE_K); i += 2u) {
         uint w;
         LOAD_U32_UNALIGNED(src0, (row_base + k0 + i) * 2u, w);
         Atile[i][col]      = f16_to_f32(w);
         Atile[i + 1u][col] = f16_to_f32(w >> 16);
     }
+#endif
 #elif defined(SRC0_BF16)
     for (uint i = 0u; i < uint(TILE_K); i += 2u) {
         uint w;
@@ -724,15 +738,29 @@ uint a_elem(uint p, uint i) {
 void load_a_part(uint row_base, uint k0, uint p, out float v[8]) {
 #if defined(SRC0_F32)
     for (uint i = 0u; i < 8u; i++) {
+#if defined(K_TAIL)
+        v[i] = (k0 + p * 8u + i < k) ? uintBitsToFloat(src0[row_base + k0 + p * 8u + i]) : 0.0;
+#else
         v[i] = uintBitsToFloat(src0[row_base + k0 + p * 8u + i]);
+#endif
     }
 #elif defined(SRC0_F16)
+#if defined(K_TAIL)
+    for (uint i = 0u; i < 8u; i++) {
+        uint bits = 0u;
+        if (k0 + p * 8u + i < k) {
+            LOAD_U16_UNALIGNED(src0, (row_base + k0 + p * 8u + i) * 2u, bits);
+        }
+        v[i] = f16_to_f32(bits);
+    }
+#else
     for (uint i = 0u; i < 8u; i += 2u) {
         uint w;
         LOAD_U32_UNALIGNED(src0, (row_base + k0 + p * 8u + i) * 2u, w);
         v[i]      = f16_to_f32(w);
         v[i + 1u] = f16_to_f32(w >> 16);
     }
+#endif
 #elif defined(SRC0_Q8_0)
     uint base = (row_base + k0 / 32u) * 34u;
     uint dbits;
@@ -856,7 +884,11 @@ void k_step(uint kt, uint tid, uint tx, uint ty, uint row0, uint a_batch, bool b
 #endif
     for (uint i = 0u; i < 4u; i++) {
         uint ki = b_part * 4u + i;
+#if defined(K_TAIL)
+        Btile[ki][b_col] = (b_ok && kt + ki < k) ? load_src1(b_base + kt + ki) : 0.0;
+#else
         Btile[ki][b_col] = b_ok ? load_src1(b_base + kt + ki) : 0.0;
+#endif
     }
     memoryBarrierShared();
     barrier();
