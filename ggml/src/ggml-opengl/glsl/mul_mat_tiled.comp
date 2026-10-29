@@ -934,7 +934,8 @@ void main() {
     if (wg_ok) {
         tile = uvec3(scratch[1u + 3u * ct], scratch[2u + 3u * ct], scratch[3u + 3u * ct]);
     }
-    uint a_batch = offset_src0 + tile.x * stride_02;
+    bool skip_tile = (tile.x & 0x80000000u) != 0u;   // pairs with id -1 (upstream #26631): computed on expert 0, stored as zero
+    uint a_batch = offset_src0 + (tile.x & 0x7fffffffu) * stride_02;
     uint n_cols  = tile.z;
     bool b_ok    = b_col < n_cols;
     uint b_base  = 0u;
@@ -1026,7 +1027,7 @@ void main() {
             uint j = tx * uint(REG_N) + in4;
             if (j < n_cols) {
                 uint pair = scratch[list_base + tile.y + j];
-                STORE_F32(dst, offset_dst + (pair % n_used) * dst_s1 + (pair / n_used) * dst_s2 + r, acc[im4][in4]);
+                STORE_F32(dst, offset_dst + (pair % n_used) * dst_s1 + (pair / n_used) * dst_s2 + r, skip_tile ? 0.0 : acc[im4][in4]);
             }
 #else
             uint c = col0 + tx * uint(REG_N) + in4;

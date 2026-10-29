@@ -28,6 +28,8 @@ layout(std140, binding = 0) uniform Params {
 
 shared uint counts[MAX_EXPERTS];
 shared uint starts[MAX_EXPERTS];
+shared uint skip_count;
+shared uint skip_start;
 
 void main() {
     uint tid     = gl_LocalInvocationID.x;
@@ -36,13 +38,18 @@ void main() {
     for (uint e = tid; e < n_experts; e += uint(WG_SIZE)) {
         counts[e] = 0u;
     }
+    if (tid == 0u) {
+        skip_count = 0u;
+    }
     memoryBarrierShared();
     barrier();
 
     for (uint p = tid; p < n_pairs; p += uint(WG_SIZE)) {
-        uint e = ids[offset_ids + (p / n_used) * ids_s1 + p % n_used];
-        if (e < n_experts) {
-            atomicAdd(counts[e], 1u);
+        int ei = int(ids[offset_ids + (p / n_used) * ids_s1 + p % n_used]);
+        if (ei < 0) {
+            atomicAdd(skip_count, 1u);
+        } else if (uint(ei) < n_experts) {
+            atomicAdd(counts[ei], 1u);
         }
     }
     memoryBarrierShared();
@@ -63,15 +70,25 @@ void main() {
             }
             pos += c;
         }
+        skip_start = pos;
+        for (uint c0 = 0u; c0 < skip_count; c0 += COLS_PER_TILE) {
+            scratch[1u + 3u * tiles]      = 0x80000000u;   // skipped slots (id -1, upstream #26631): the kernel stores zeros
+            scratch[1u + 3u * tiles + 1u] = pos + c0;
+            scratch[1u + 3u * tiles + 2u] = min(skip_count - c0, COLS_PER_TILE);
+            tiles++;
+        }
         scratch[0] = tiles;
     }
     memoryBarrierShared();
     barrier();
 
     for (uint p2 = tid; p2 < n_pairs; p2 += uint(WG_SIZE)) {
-        uint e = ids[offset_ids + (p2 / n_used) * ids_s1 + p2 % n_used];
-        if (e < n_experts) {
-            uint slot = atomicAdd(starts[e], 1u);
+        int ei = int(ids[offset_ids + (p2 / n_used) * ids_s1 + p2 % n_used]);
+        if (ei < 0) {
+            uint slot = atomicAdd(skip_start, 1u);
+            scratch[list_base + slot] = p2;
+        } else if (uint(ei) < n_experts) {
+            uint slot = atomicAdd(starts[ei], 1u);
             scratch[list_base + slot] = p2;
         }
     }
