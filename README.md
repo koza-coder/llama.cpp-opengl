@@ -7,6 +7,9 @@
 > - **Tested** (v0.1.0 zip): AMD Radeon AI PRO R9700 with Qwen2.5-0.5B Q4_0: prompt pp512 5947 tok/s, generation tg64 131 tok/s, perplexity 17.29
 > - **Build, test, settings:** [docs/backend/OPENGL.md](docs/backend/OPENGL.md)
 > - **Backend source:** [ggml/src/ggml-opengl](ggml/src/ggml-opengl)
+> - **Other versions:** [DirectX 12](https://github.com/koza-coder/llama.cpp-directx12) (first choice on current GPUs,
+>   faster generation), [DirectX 11](https://github.com/koza-coder/llama.cpp-directx11) for older GPUs and drivers - same llama.cpp, only the GPU backend differs
+> - **Experimental:** [DirectX 9](https://github.com/koza-coder/llama.cpp-directx9) - only the matrix products run on the GPU
 >
 > Everything below is the upstream llama.cpp README.
 
