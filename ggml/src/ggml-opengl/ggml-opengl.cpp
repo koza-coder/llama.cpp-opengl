@@ -2646,7 +2646,7 @@ static void ggml_opengl_rope(gl_device_ctx & dev, ggml_tensor * src0, ggml_tenso
     memcpy(sections, (int32_t *) dst->op_params + 11, 4 * sizeof(int));
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_dims[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_dims);
 
     const uint32_t n_threads = (uint32_t) (ggml_nelements(src0) / 2);
     std::vector<uint32_t> params = {
@@ -4253,6 +4253,10 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
                    (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
+                if (op->src[5] != nullptr) {
+                    return false;
+                }
                 // f32/f16/bf16 and q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl KV, f16 mask, head sizes up to 576 and multiples of 4
                 // (32 for the block types); contiguous
                 // rows and a contiguous dst
