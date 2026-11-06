@@ -3504,6 +3504,12 @@ static void ggml_opengl_encode_graph(gl_device_ctx & dev, const ggml_cgraph * cg
                     n->src[1] ? ggml_type_name(n->src[1]->type) : "-");
             fflush(stderr);
         }
+        // a node that is not marked for compute belongs to a branch ggml_build_forward_select did not pick, or an
+        // inactive branch a model leaves for allocation only (Clover delta-net decode/prefill): running it reads unset
+        // inputs and can overwrite state (exp1022)
+        if ((cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
         const int used = ggml_opengl_try_fuse(dev, cgraph, i);
         if (dev.trace && !dev.collecting) {
             glFinish();
