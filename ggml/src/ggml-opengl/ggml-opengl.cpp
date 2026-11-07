@@ -3703,6 +3703,9 @@ static ggml_backend_buffer_i ggml_backend_opengl_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_opengl_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_opengl_buffer_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_opengl(ggml_backend_buffer_t buffer) {
