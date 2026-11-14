@@ -1787,23 +1787,6 @@ static void ggml_opengl_out_prod(gl_device_ctx & dev, ggml_tensor * src0, ggml_t
                         CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
 
-// ADD1: dst = src0 plus a scalar that lives in device memory
-static void ggml_opengl_add1(gl_device_ctx & dev, ggml_tensor * src0, ggml_tensor * src1,
-                            ggml_tensor * dst) {
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "add1", glsl_add1, {});
-    const gl_binding b0 = ggml_opengl_bind_tensor(dev, src0);
-    const gl_binding b1 = ggml_opengl_bind_tensor(dev, src1);
-    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
-    const uint32_t      n_rows = (uint32_t) ggml_nrows(dst);
-    std::vector<uint32_t> params = {
-        b0.elem_offset, b1.elem_offset, bd.elem_offset,
-        (uint32_t) (src0->nb[1] / 4), (uint32_t) (src0->nb[2] / 4), (uint32_t) (src0->nb[3] / 4),
-        (uint32_t) (dst->nb[1] / 4), (uint32_t) (dst->nb[2] / 4), (uint32_t) (dst->nb[3] / 4),
-        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2], n_rows,
-    };
-    ggml_opengl_dispatch(dev, pipeline, params, { b0, b1, bd }, n_rows);
-}
-
 static void ggml_opengl_im2col_3d(gl_device_ctx & dev, ggml_tensor * dst) {
     const ggml_tensor * kernel = dst->src[0];
     const ggml_tensor * src    = dst->src[1];
@@ -1935,20 +1918,6 @@ static void ggml_opengl_col2im_1d(gl_device_ctx & dev, ggml_tensor * src, ggml_t
         k_oc, (uint32_t) src->ne[1], k_oc / oc, (uint32_t) dst->ne[0],
         (uint32_t) ggml_get_op_params_i32(dst, 0), (uint32_t) ggml_get_op_params_i32(dst, 2),
         ne,
-    };
-    ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
-}
-
-// DIAG_MASK_INF / DIAG_MASK_ZERO: copy src and replace everything right of the shifted diagonal
-static void ggml_opengl_diag_mask(gl_device_ctx & dev, ggml_tensor * src, ggml_tensor * dst, float value) {
-    gl_pipeline & pipeline = ggml_opengl_get_pipeline(dev, "diag_mask", glsl_diag_mask, {});
-    const gl_binding bs = ggml_opengl_bind_tensor(dev, src);
-    const gl_binding bd = ggml_opengl_bind_tensor(dev, dst);
-    const uint32_t      ne = (uint32_t) ggml_nelements(dst);
-    std::vector<uint32_t> params = {
-        bs.elem_offset, bd.elem_offset, ne,
-        (uint32_t) dst->ne[0], (uint32_t) dst->ne[1],
-        (uint32_t) ggml_get_op_params_i32(dst, 0), ggml_opengl_u32_from_f32(value),
     };
     ggml_opengl_dispatch(dev, pipeline, params, { bs, bd }, CEIL_DIV(ne, (uint32_t) GGML_GL_WG_SIZE));
 }
@@ -3259,12 +3228,6 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
         case GGML_OP_COL2IM_1D:
             ggml_opengl_col2im_1d(dev, node->src[0], node);
             return;
-        case GGML_OP_DIAG_MASK_INF:
-            ggml_opengl_diag_mask(dev, node->src[0], node, -INFINITY);
-            return;
-        case GGML_OP_DIAG_MASK_ZERO:
-            ggml_opengl_diag_mask(dev, node->src[0], node, 0.0f);
-            return;
         case GGML_OP_GET_ROWS_BACK:
             ggml_opengl_get_rows_back(dev, node);
             return;
@@ -3324,9 +3287,6 @@ static void ggml_opengl_encode_node(gl_device_ctx & dev, ggml_tensor * node) {
             return;
         case GGML_OP_OUT_PROD:
             ggml_opengl_out_prod(dev, node->src[0], node->src[1], node);
-            return;
-        case GGML_OP_ADD1:
-            ggml_opengl_add1(dev, node->src[0], node->src[1], node);
             return;
         case GGML_OP_IM2COL_3D:
             ggml_opengl_im2col_3d(dev, node);
@@ -4107,10 +4067,6 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float) &&
                    ggml_nelements(op) <= UINT32_MAX;
-        case GGML_OP_ADD1:
-            return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
-                   op->type == GGML_TYPE_F32 && ggml_is_scalar(src1) &&
-                   src0->nb[0] == sizeof(float) && op->nb[0] == sizeof(float);
         case GGML_OP_IM2COL_3D:
             {
                 // IC comes from op_params, not from a shape, so it has to be sane before N is derived from it
@@ -4155,12 +4111,6 @@ static bool ggml_backend_opengl_device_supports_op(ggml_backend_dev_t dev, const
             return op->type == src0->type && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
                    ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
                    ggml_get_op_params_i32(op, 1) > 0 && ggml_get_op_params_i32(op, 0) > 0 &&
-                   ggml_nelements(op) <= UINT32_MAX;
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_DIAG_MASK_ZERO:
-            // the flat index assumes both sides are contiguous, which is what the CPU asserts too
-            return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(src0) && ggml_is_contiguous(op) &&
                    ggml_nelements(op) <= UINT32_MAX;
         case GGML_OP_GET_ROWS_BACK:
             return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 &&
